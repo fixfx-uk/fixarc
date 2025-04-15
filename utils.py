@@ -421,62 +421,28 @@ def run_nuke_action(actions: List[str],
         start_time = time.time()
         log.debug(f"Nuke process starting at: {datetime.datetime.now().strftime('%H:%M:%S')}")
         
-        # Execute the command using Popen for more control
-        with subprocess.Popen(
+        # Execute the command with timeout using subprocess.run
+        # This is a simpler approach that works on Windows
+        process = subprocess.run(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
+            check=False,
+            timeout=timeout,
             encoding='utf-8',
             errors='replace'
-        ) as process:
-            # Set up progress logging
-            elapsed = 0
-            stdout_chunks = []
-            stderr_chunks = []
-            
-            while process.poll() is None:
-                # Check for timeout
-                elapsed = time.time() - start_time
-                if elapsed > timeout:
-                    process.terminate()
-                    log.error(f"Nuke process terminated after {elapsed:.1f}s (exceeded timeout of {timeout}s)")
-                    raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
-                
-                # Log progress every 10 seconds
-                if int(elapsed) % 10 == 0 and int(elapsed) > 0:
-                    log.info(f"Nuke process running for {int(elapsed)}s...")
-                
-                # Non-blocking read from stdout and stderr
-                stdout_ready = select.select([process.stdout], [], [], 0.1)[0]
-                if stdout_ready:
-                    stdout_chunk = process.stdout.read(1024)
-                    if stdout_chunk:
-                        stdout_chunks.append(stdout_chunk)
-                        
-                stderr_ready = select.select([process.stderr], [], [], 0.1)[0]
-                if stderr_ready:
-                    stderr_chunk = process.stderr.read(1024)
-                    if stderr_chunk:
-                        stderr_chunks.append(stderr_chunk)
-                        
-                # Small delay to prevent CPU spinning
-                time.sleep(0.1)
-            
-            # Process completed, get final output
-            final_stdout, final_stderr = process.communicate()
-            if final_stdout:
-                stdout_chunks.append(final_stdout)
-            if final_stderr:
-                stderr_chunks.append(final_stderr)
-                
-            # Combine all output
-            stdout_output = ''.join(stdout_chunks)
-            stderr_output = ''.join(stderr_chunks)
-            returncode = process.returncode
-            
-            log.debug(f"Nuke process finished after {elapsed:.1f}s. Exit Code: {returncode}")
-            full_output = f"--- Nuke stdout ---\n{stdout_output}\n\n--- Nuke stderr ---\n{stderr_output}"
+        )
+        
+        # Calculate elapsed time
+        elapsed = time.time() - start_time
+        
+        # Store combined output for potential debugging
+        stdout_output = process.stdout
+        stderr_output = process.stderr
+        returncode = process.returncode
+        
+        log.debug(f"Nuke process finished after {elapsed:.1f}s. Exit Code: {returncode}")
+        full_output = f"--- Nuke stdout ---\n{stdout_output}\n\n--- Nuke stderr ---\n{stderr_output}"
 
         # Log the full raw output only at DEBUG level to avoid cluttering logs
         if full_output.strip():
