@@ -1,7 +1,7 @@
 """Command-line interface for the Fix Archive tool.
 
 Example:
- python -m fix-archive.cli "Z:/proj/bob01/shots/BOB_100/BOB_100_000/BOB_100_000_050_MTS/publish/nuke/BOB_100_000_050_MTS_Comp_v007.nk" \
+ python -m fixarc.cli "Z:/proj/bob01/shots/BOB_100/BOB_100_000/BOB_100_000_050_MTS/publish/nuke/BOB_100_000_050_MTS_Comp_v007.nk" \
     --archive-root "W:\proj\bob01\delivery\archive" \
     --vendor "FixFX"
 
@@ -35,7 +35,7 @@ from .exceptions import (
 def create_parser() -> argparse.ArgumentParser:
     """Creates the argument parser."""
     parser = argparse.ArgumentParser(
-        prog="fix-archive", # Define the program name for help message
+        prog="fixarc", # Define the program name for help message
         description="Fix Archive Tool. Prepares Nuke scripts and dependencies for archival.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter # Shows defaults in help
     )
@@ -398,10 +398,10 @@ def main(args=None):
                      log.warning(f"Failed to remove temporary file {temp_file}: {e}")
 
 if __name__ == "__main__":
-    # Allows running the CLI using `python -m fix-archive.cli` or directly
+    # Allows running the CLI using `python -m fixarc.cli` or directly
     try:
         main()
     except ImportError as e:
         print(f"Error: {e}")
-        print("Try running with: python -m fix-archive.cli [args]")
+        print("Try running with: python -m fixarc.cli [args]")
         sys.exit(1)

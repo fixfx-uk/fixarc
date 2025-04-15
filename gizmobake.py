@@ -39,7 +39,7 @@ def bake_gizmos_in_script(script_path: str, dry_run: bool = False) -> str:
     # Prepare a temporary output path for Nuke to save the baked script *if* baking occurs
     temp_baked_path = None
     try:
-        fd, temp_baked_path = tempfile.mkstemp(suffix="_baked.nk", prefix="fixarchive_", text=True)
+        fd, temp_baked_path = tempfile.mkstemp(suffix="_baked.nk", prefix="fixarc_", text=True)
         os.close(fd) # Close descriptor, Nuke will handle writing
         log.debug(f"Generated temporary path for potential baked script: {temp_baked_path}")
     except Exception as e:

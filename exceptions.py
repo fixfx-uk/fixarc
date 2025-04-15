@@ -13,7 +13,7 @@ except ImportError:
 
 
 class ArchiveError(_BaseException):
-    """Base class for fix-archive specific errors."""
+    """Base class for fixarc specific errors."""
     pass
 
 class ParsingError(ArchiveError):

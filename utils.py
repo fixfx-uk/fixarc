@@ -8,6 +8,9 @@ import json
 import tempfile
 import platform
 import sys # Keep sys import for potential fallback logging
+import time
+import select
+import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Union
 
@@ -23,7 +26,7 @@ from .constants import (
 # This ensures we use fixfx.core.logger if available, or the fallback.
 try:
     from . import get_logger
-    log = get_logger(__name__) # Get logger named 'fix-archive.utils'
+    log = get_logger(__name__) # Get logger named 'fixarc.utils'
 except ImportError:
     # This should ideally not happen if __init__.py ran, but basic fallback
     import logging
@@ -288,37 +291,72 @@ def parse_frame_range(range_str: Optional[str]) -> Optional[Tuple[int, int]]:
 # --- Nuke Interaction ---
 def get_nuke_executable() -> str:
     """Finds the Nuke executable path based on OS and environment."""
-    nuke_path_env = os.getenv("NUKE_EXE_PATH")
-    # Check if env var exists and points to a valid file
-    if nuke_path_env:
-         if Path(nuke_path_env).is_file():
-              log.debug(f"Using Nuke executable from NUKE_EXE_PATH: {nuke_path_env}")
-              return nuke_path_env
-         else:
-              log.warning(f"NUKE_EXE_PATH ('{nuke_path_env}') is set but does not point to a valid file. Trying defaults.")
-
-    log.debug("NUKE_EXE_PATH not set or invalid, trying OS defaults from constants.")
     # Select default based on current OS
     if OS == OS_WIN:
         nuke_path = NUKE_EXEC_PATH_WIN
+        # List of potential Nuke install locations on Windows
+        alternate_paths = [
+            "C:\\Program Files\\Nuke*\\Nuke*.exe",
+            "C:\\Program Files\\Foundry\\Nuke*\\Nuke*.exe"
+        ]
     elif OS == OS_LIN:
         nuke_path = NUKE_EXEC_PATH_LIN
+        # List of potential Nuke install locations on Linux
+        alternate_paths = [
+            "/usr/local/Nuke*/Nuke*",
+            "/opt/Nuke*/Nuke*",
+            "/opt/Foundry/Nuke*/Nuke*"
+        ]
     elif OS == OS_MAC:
         nuke_path = NUKE_EXEC_PATH_MAC
+        # List of potential Nuke install locations on Mac
+        alternate_paths = [
+            "/Applications/Nuke*.app/Contents/MacOS/Nuke*"
+        ]
     else:
         # Should not happen if OS detection works
         raise EnvironmentError(f"Unsupported operating system '{OS}' for Nuke.")
 
     # Validate the default path
-    if not Path(nuke_path).is_file():
-        # Try searching common install locations as a last resort? More complex.
-        # For now, raise error if default is also invalid.
-        raise ConfigurationError(
-            f"Nuke executable not found at default location: '{nuke_path}'. "
-            f"Please ensure Nuke is installed correctly or set the NUKE_EXE_PATH environment variable."
-        )
-    log.debug(f"Using default Nuke executable for {OS}: {nuke_path}")
-    return nuke_path
+    if Path(nuke_path).is_file():
+        log.debug(f"Using default Nuke executable for {OS}: {nuke_path}")
+        return nuke_path
+    
+    log.warning(f"Nuke executable not found at default location: '{nuke_path}'. Trying alternate locations...")
+    
+    # Try checking alternate common install locations
+    import glob
+    for pattern in alternate_paths:
+        possible_paths = glob.glob(pattern)
+        if possible_paths:
+            # Sort to get the highest version
+            possible_paths.sort(reverse=True)
+            nuke_path = possible_paths[0]
+            log.info(f"Found Nuke executable at alternate location: {nuke_path}")
+            return nuke_path
+    
+    # Additional custom check: look for NUKE_PATH or NUKE_ROOT environment variables
+    for env_var in ["NUKE_EXE_PATH", "NUKE_PATH", "NUKE_ROOT"]:
+        env_path = os.environ.get(env_var)
+        if env_path:
+            log.info(f"Checking environment variable {env_var}={env_path}")
+            if Path(env_path).is_file() and "nuke" in env_path.lower():
+                log.info(f"Using Nuke executable from {env_var}: {env_path}")
+                return env_path
+            elif Path(env_path).is_dir():
+                # If it's a directory, look for nuke executable inside
+                possible_execs = list(Path(env_path).glob("**/Nuke*.exe" if OS == OS_WIN else "**/Nuke*"))
+                if possible_execs:
+                    nuke_path = str(possible_execs[0])
+                    log.info(f"Found Nuke executable in {env_var} directory: {nuke_path}")
+                    return nuke_path
+    
+    # If we get here, we failed to find Nuke
+    raise ConfigurationError(
+        f"Nuke executable not found at default location: '{nuke_path}' or any alternate locations. "
+        f"Please ensure Nuke is installed correctly or set the NUKE_EXE_PATH environment variable. "
+        f"Expected locations on {OS} include: {', '.join(alternate_paths)}"
+    )
 
 
 # Path to the nuke_ops.py script within this package
@@ -330,7 +368,7 @@ def run_nuke_action(actions: List[str],
                     node_name: Optional[str] = None,
                     output_path: Optional[str] = None,
                     frame_range: Optional[Tuple[int, int]] = None,
-                    timeout: int = 300) -> Dict[str, Any]:
+                    timeout: int = 120) -> Dict[str, Any]:
     """
     Runs the nuke_ops.py script via 'nuke -t' to perform specific actions.
 
@@ -341,7 +379,7 @@ def run_nuke_action(actions: List[str],
         node_name: Single node name (if required by action).
         output_path: Output file path (if required by actions).
         frame_range: Optional tuple (start, end) for frame range override.
-        timeout: Timeout in seconds for the Nuke process.
+        timeout: Timeout in seconds for the Nuke process (default reduced to 120).
 
     Returns:
         Dictionary containing the results or errors parsed from the Nuke script's JSON output.
@@ -375,44 +413,90 @@ def run_nuke_action(actions: List[str],
         # Format frame range tuple as "start-end" string for argparse
         command.extend(["--frame-range", f"{frame_range[0]}-{frame_range[1]}"])
 
-    log.info(f"Running Nuke command: {' '.join(command)}")
+    log.info(f"Running Nuke command with {timeout}s timeout: {' '.join(command)}")
     full_output = "" # Initialize variable to store output for debugging on error
 
     try:
-        # Execute the command
-        process = subprocess.run(
+        # Log start time
+        start_time = time.time()
+        log.debug(f"Nuke process starting at: {datetime.datetime.now().strftime('%H:%M:%S')}")
+        
+        # Execute the command using Popen for more control
+        with subprocess.Popen(
             command,
-            capture_output=True, # Capture stdout and stderr
-            text=True, # Decode output as text using default encoding
-            check=False, # Don't raise exception for non-zero exit codes here
-            timeout=timeout, # Set timeout
-            encoding='utf-8', # Explicitly use utf-8
-            errors='replace' # Replace invalid characters instead of crashing
-        )
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace'
+        ) as process:
+            # Set up progress logging
+            elapsed = 0
+            stdout_chunks = []
+            stderr_chunks = []
+            
+            while process.poll() is None:
+                # Check for timeout
+                elapsed = time.time() - start_time
+                if elapsed > timeout:
+                    process.terminate()
+                    log.error(f"Nuke process terminated after {elapsed:.1f}s (exceeded timeout of {timeout}s)")
+                    raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
+                
+                # Log progress every 10 seconds
+                if int(elapsed) % 10 == 0 and int(elapsed) > 0:
+                    log.info(f"Nuke process running for {int(elapsed)}s...")
+                
+                # Non-blocking read from stdout and stderr
+                stdout_ready = select.select([process.stdout], [], [], 0.1)[0]
+                if stdout_ready:
+                    stdout_chunk = process.stdout.read(1024)
+                    if stdout_chunk:
+                        stdout_chunks.append(stdout_chunk)
+                        
+                stderr_ready = select.select([process.stderr], [], [], 0.1)[0]
+                if stderr_ready:
+                    stderr_chunk = process.stderr.read(1024)
+                    if stderr_chunk:
+                        stderr_chunks.append(stderr_chunk)
+                        
+                # Small delay to prevent CPU spinning
+                time.sleep(0.1)
+            
+            # Process completed, get final output
+            final_stdout, final_stderr = process.communicate()
+            if final_stdout:
+                stdout_chunks.append(final_stdout)
+            if final_stderr:
+                stderr_chunks.append(final_stderr)
+                
+            # Combine all output
+            stdout_output = ''.join(stdout_chunks)
+            stderr_output = ''.join(stderr_chunks)
+            returncode = process.returncode
+            
+            log.debug(f"Nuke process finished after {elapsed:.1f}s. Exit Code: {returncode}")
+            full_output = f"--- Nuke stdout ---\n{stdout_output}\n\n--- Nuke stderr ---\n{stderr_output}"
 
-        # Store combined output for potential debugging
-        full_output = f"--- Nuke stdout ---\n{process.stdout}\n\n--- Nuke stderr ---\n{process.stderr}"
-
-        log.debug(f"Nuke process finished. Exit Code: {process.returncode}")
         # Log the full raw output only at DEBUG level to avoid cluttering logs
         if full_output.strip():
-           log.debug(f"Nuke Raw Output (stdout & stderr):\n{full_output.strip()}")
+            log.debug(f"Nuke Raw Output (stdout & stderr):\n{full_output.strip()}")
 
         # --- Process Results ---
         # Even if exit code is non-zero, try parsing stdout for potential error messages from nuke_ops.py
         results = {}
         try:
-            results = _parse_nuke_ops_output(process.stdout) # Try parsing JSON from stdout
+            results = _parse_nuke_ops_output(stdout_output) # Try parsing JSON from stdout
         except ParsingError as pe:
             # Parsing failed, log error but check exit code before raising fully
             log.error(f"Failed to parse JSON results from Nuke stdout: {pe}")
-            if process.returncode != 0:
+            if returncode != 0:
                 # Nuke failed *and* output is unparseable - raise critical error
-                error_message = f"Nuke process failed (Exit Code {process.returncode}) and output parsing error: {pe}."
+                error_message = f"Nuke process failed (Exit Code {returncode}) and output parsing error: {pe}."
                 log.error(error_message)
                 # Include stderr for context if available
-                if process.stderr.strip():
-                     error_message += f"\nNuke stderr: {process.stderr.strip()[:1000]}..." # Limit length
+                if stderr_output.strip():
+                     error_message += f"\nNuke stderr: {stderr_output.strip()[:1000]}..." # Limit length
                 raise ArchiveError(error_message) from pe
             else:
                  # Nuke exited cleanly but output unparseable - strange, raise parsing error
@@ -427,8 +511,8 @@ def run_nuke_action(actions: List[str],
              raise ArchiveError(f"Nuke failed to load script: {results['load_error']}")
 
         # If Nuke process had non-zero exit code, but we parsed results, treat as failure but return results
-        if process.returncode != 0:
-            error_message = f"Nuke process execution failed (Exit Code {process.returncode}) for actions: {actions}."
+        if returncode != 0:
+            error_message = f"Nuke process execution failed (Exit Code {returncode}) for actions: {actions}."
             log.error(error_message)
             results['execution_error'] = error_message # Add flag to results
             # Check if specific action errors were also reported
@@ -514,6 +598,7 @@ def copy_file_or_sequence(source_path: str, dest_path: str, frame_range: Optiona
     Logs warnings for missing sequence frames but attempts to continue.
     """
     copied_pairs = []
+    start_time = time.time()
     try:
         norm_source = normalize_path(source_path)
         norm_dest = normalize_path(dest_path)
@@ -538,6 +623,10 @@ def copy_file_or_sequence(source_path: str, dest_path: str, frame_range: Optiona
                 # Catch permission errors, etc.
                 raise ArchiverError(f"Failed to create target directory '{target_dir}': {e}") from e
 
+        # --- Check for existing destination ---
+        if not dry_run and Path(norm_dest).exists() and not is_seq:
+            log.warning(f"Destination file already exists: {norm_dest}. Will be overwritten.")
+            
         # --- Perform Copy ---
         if is_seq:
             # --- Sequence Copy ---
@@ -554,17 +643,35 @@ def copy_file_or_sequence(source_path: str, dest_path: str, frame_range: Optiona
             if len(source_files) != len(dest_files):
                  raise ArchiverError(f"Sequence length mismatch: Source expansion ({len(source_files)}) != Dest expansion ({len(dest_files)}). Src='{norm_source}', Dst='{norm_dest}'")
 
-            log.info(f"Processing sequence '{Path(norm_source).name}' ({len(source_files)} frames from {frame_range[0]} to {frame_range[1]})...")
+            total_frames = len(source_files)
+            log.info(f"Processing sequence '{Path(norm_source).name}' ({total_frames} frames from {frame_range[0]} to {frame_range[1]})...")
             frames_copied_count = 0
             frames_skipped_count = 0
             copy_errors = []
-
-            for src_frame_path, dst_frame_path in zip(source_files, dest_files):
+            
+            # Progress reporting thresholds
+            report_interval = max(1, min(100, total_frames // 10))  # Report at 10% intervals
+            last_report_time = time.time()
+            
+            for i, (src_frame_path, dst_frame_path) in enumerate(zip(source_files, dest_files)):
+                # Progress reporting
+                if i % report_interval == 0 or i == total_frames - 1 or time.time() - last_report_time > 5:
+                    percent_done = (i / total_frames) * 100
+                    elapsed = time.time() - start_time
+                    if elapsed > 0 and i > 0:
+                        frames_per_sec = i / elapsed
+                        est_remaining = (total_frames - i) / frames_per_sec if frames_per_sec > 0 else 0
+                        log.info(f"Sequence progress: {i}/{total_frames} frames ({percent_done:.1f}%) - "
+                                 f"{frames_per_sec:.1f} frames/sec, ~{est_remaining:.1f}s remaining")
+                    else:
+                        log.info(f"Sequence progress: {i}/{total_frames} frames ({percent_done:.1f}%)")
+                    last_report_time = time.time()
+                
                 norm_src_frame = normalize_path(src_frame_path)
                 norm_dst_frame = normalize_path(dst_frame_path)
                 if dry_run:
                     # Simulate validation and copy
-                    log.info(f"[DRY RUN] Would validate and copy: {norm_src_frame} -> {norm_dst_frame}")
+                    log.debug(f"[DRY RUN] Would validate and copy: {norm_src_frame} -> {norm_dst_frame}")
                     # Assume validation passes in dry run for reporting
                     copied_pairs.append((norm_src_frame, norm_dst_frame))
                     frames_copied_count += 1
@@ -578,8 +685,27 @@ def copy_file_or_sequence(source_path: str, dest_path: str, frame_range: Optiona
                              frames_skipped_count += 1
                              continue # Go to next frame
 
-                        # log.debug(f"Copying frame: {norm_src_frame} -> {norm_dst_frame}") # Can be very verbose
+                        # Check if destination already exists
+                        if Path(norm_dst_frame).exists():
+                            log.debug(f"Destination frame already exists, overwriting: {norm_dst_frame}")
+                            
+                        # Check source file size
+                        src_size = src_frame_obj.stat().st_size
+                        if src_size == 0:
+                            log.warning(f"Source frame has zero size: {norm_src_frame}")
+                                
+                        # Copy with progress tracking for large files (over 100MB)
+                        if src_size > 100 * 1024 * 1024:
+                            log.info(f"Copying large frame ({src_size/1024/1024:.1f} MB): {norm_src_frame}")
+                            
                         shutil.copy2(norm_src_frame, norm_dst_frame) # copy2 preserves metadata
+                        
+                        # Verify the copy succeeded and file sizes match
+                        if Path(norm_dst_frame).exists():
+                            dst_size = Path(norm_dst_frame).stat().st_size
+                            if dst_size != src_size:
+                                log.warning(f"Size mismatch after copy: Source={src_size} bytes, Dest={dst_size} bytes")
+                                
                         copied_pairs.append((norm_src_frame, norm_dst_frame))
                         frames_copied_count += 1
                     except Exception as e:
@@ -587,17 +713,25 @@ def copy_file_or_sequence(source_path: str, dest_path: str, frame_range: Optiona
                         error_msg = f"Failed to copy sequence frame {norm_src_frame} to {norm_dst_frame}: {e}"
                         log.error(error_msg)
                         copy_errors.append(error_msg)
-                        # Decide: Stop on first error, or try all frames? Try all for now.
                         frames_skipped_count += 1 # Count errors as skipped
-
-            log.info(f"Sequence copy complete: {frames_copied_count} frames copied, {frames_skipped_count} frames skipped (missing or error).")
+                        
+                        # If we have multiple consecutive errors, maybe there's a systemic problem
+                        if len(copy_errors) >= 3 and all(error_msg in e for e in copy_errors[-3:]):
+                            log.error("Multiple consecutive similar errors detected, may indicate a systemic problem")
+                        
+            total_time = time.time() - start_time
+            frames_per_sec = frames_copied_count / total_time if total_time > 0 else 0
+            log.info(f"Sequence copy complete: {frames_copied_count} frames copied, {frames_skipped_count} frames skipped in {total_time:.1f}s ({frames_per_sec:.1f} frames/sec)")
+            
             # If ALL frames failed or were skipped, raise an error
             if frames_copied_count == 0 and (frames_skipped_count > 0 or copy_errors):
                  raise DependencyError(f"Failed to copy any frames for sequence '{norm_source}'. {frames_skipped_count} frames missing/skipped. First error: {copy_errors[0] if copy_errors else 'All frames missing'}")
+            elif copy_errors and frames_copied_count < total_frames * 0.9:  # If less than 90% copied successfully
+                 # Raise error for significant failures
+                 raise ArchiverError(f"Only copied {frames_copied_count}/{total_frames} frames for sequence '{norm_source}'. Encountered {len(copy_errors)} errors. First error: {copy_errors[0]}")
             elif copy_errors:
-                 # If some frames copied but others failed, maybe just log warning? Or raise?
-                 # Let's raise for now to be safe, caller can decide how to handle partial copies.
-                 raise ArchiverError(f"Encountered {len(copy_errors)} errors during sequence copy for '{norm_source}'. First error: {copy_errors[0]}")
+                 # Just log a warning if most frames copied successfully
+                 log.warning(f"Copied {frames_copied_count}/{total_frames} frames with {len(copy_errors)} errors for sequence '{norm_source}'")
 
         else:
             # --- Single File Copy ---
@@ -608,9 +742,25 @@ def copy_file_or_sequence(source_path: str, dest_path: str, frame_range: Optiona
                 try:
                     # Validate source file exists just before copy
                     validate_path_exists(norm_source, "Single file dependency") # Will raise if not found
-                    log.debug(f"Copying single file: {norm_source} -> {norm_dest}")
+                    
+                    # Check file size for large file logging
+                    src_size = Path(norm_source).stat().st_size
+                    if src_size > 100 * 1024 * 1024:  # 100MB
+                        log.info(f"Copying large file ({src_size/1024/1024:.1f} MB): {norm_source} -> {norm_dest}")
+                    else:
+                        log.debug(f"Copying single file ({src_size/1024:.1f} KB): {norm_source} -> {norm_dest}")
+                        
                     shutil.copy2(norm_source, norm_dest)
+                    
+                    # Verify the copy succeeded
+                    if Path(norm_dest).exists():
+                        dst_size = Path(norm_dest).stat().st_size
+                        if dst_size != src_size:
+                            log.warning(f"Size mismatch after copy: Source={src_size} bytes, Dest={dst_size} bytes")
+                    
                     copied_pairs.append((norm_source, norm_dest))
+                    total_time = time.time() - start_time
+                    log.debug(f"File copy completed in {total_time:.2f}s")
                 except (DependencyError, Exception) as e:
                     # Re-raise errors during single file copy as ArchiverError
                     raise ArchiverError(f"Failed to copy file {norm_source} to {norm_dest}: {e}") from e
@@ -629,9 +779,6 @@ def get_metadata_from_path(script_path: str) -> Dict[str, Any]:
     Uses fixfx.data.StudioData (if available) to attempt extracting metadata.
     Returns an empty dict if parsing fails, path is not recognized, or fixfx is unavailable.
     """
-    if not _fixenv_available: # Check if fixfx/fixenv was imported successfully
-        log.warning("Cannot extract metadata from path: 'fixfx'/'fixenv' packages not available.")
-        return {}
     try:
         # Import locally to reduce startup impact and handle missing dependency gracefully
         from fixfx.data.studio_data import StudioData

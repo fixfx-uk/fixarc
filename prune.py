@@ -108,7 +108,7 @@ def save_pruned_script(script_path: str, nodes_to_keep: List[str]) -> str:
     temp_pruned_path = None
     try:
         # Use mkstemp for unique temporary file name generation
-        fd, temp_pruned_path = tempfile.mkstemp(suffix="_pruned.nk", prefix="fixarchive_", text=True)
+        fd, temp_pruned_path = tempfile.mkstemp(suffix="_pruned.nk", prefix="fixarc_", text=True)
         os.close(fd) # Close descriptor, we just need the path name
         log.debug(f"Generated temporary path for pruned script: {temp_pruned_path}")
     except Exception as e:
