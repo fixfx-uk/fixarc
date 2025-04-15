@@ -1,4 +1,5 @@
-"""Utility functions for the Fix Archive tool."""
+# fixarc/utils.py
+"""Utility functions for the Fix Archive (fixarc) tool."""
 
 import os
 import re
@@ -7,786 +8,502 @@ import subprocess
 import json
 import tempfile
 import platform
-import sys # Keep sys import for potential fallback logging
+import sys
 import time
 import select
 import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Union
 
-import constants
-from .constants import (
-    NUKE_EXEC_PATH_WIN,
-    NUKE_EXEC_PATH_LIN,
-    NUKE_EXEC_PATH_MAC,
-)
-
-# --- Logging Setup ---
-# Import the get_logger function configured in the parent __init__.
-# This ensures we use fixfx.core.logger if available, or the fallback.
-try:
-    from . import get_logger
-    log = get_logger(__name__) # Get logger named 'fixarc.utils'
-except ImportError:
-    # This should ideally not happen if __init__.py ran, but basic fallback
-    import logging
-    log = logging.getLogger(__name__)
-    if not log.hasHandlers():
-        handler = logging.StreamHandler(sys.stdout)
-        formatter = logging.Formatter('%(asctime)s [%(levelname)s] [%(name)s]: %(message)s')
-        handler.setFormatter(formatter)
-        log.addHandler(handler)
-        log.setLevel(logging.INFO)
-    log.error("Could not import get_logger from parent package. Using basic logging.")
-
+# Use logger from __init__
+from . import log
 # Import constants and exceptions relative to the package
 from . import constants
 from .exceptions import (
     DependencyError, ConfigurationError, ArchiveError, ParsingError, PruningError,
-    RepathingError, GizmoError # Ensure all used exceptions are imported
+    RepathingError, GizmoError, NukeExecutionError
 )
 
 # --- Fixenv Integration ---
-from fixenv import OS, OS_WIN, OS_LIN, OS_MAC
-import fixenv
+# Assume fixenv might be available, provide fallbacks if not
+try:
+    from fixenv import OS, OS_WIN, OS_LIN, OS_MAC
+    from fixenv import normalize_path as fixenv_normalize_path
+    from fixenv import sanitize_path as fixenv_sanitize_path
+    from fixenv import get_metadata_from_path as fixenv_get_metadata # Use fixenv's metadata parser
+    _fixenv_available = True
+    log.debug("Using fixenv for OS detection and path handling.")
+except ImportError:
+    log.warning("fixenv package not found. Using basic OS detection and path normalization.")
+    _fixenv_available = False
+    OS = platform.system()
+    OS_WIN, OS_LIN, OS_MAC = "Windows", "Linux", "Darwin"
+
+    # Basic fallbacks
+    def fixenv_normalize_path(path: Union[str, Path]) -> str:
+        return str(path).replace("\\", "/")
+
+    def fixenv_sanitize_path(path: Union[str, Path]) -> str:
+        p = Path(fixenv_normalize_path(path))
+        try: return str(p.resolve(strict=False)) # strict=False for non-existent paths
+        except Exception: return str(p.absolute())
+
+    def fixenv_get_metadata(script_path: str) -> Dict[str, Any]:
+         log.warning("Cannot extract metadata from path: 'fixenv'/'fixfx' packages not available.")
+         return {}
 
 # --- Path Manipulation & Validation ---
-from fixenv import normalize_path
+def normalize_path(path: Union[str, Path]) -> str:
+    """Normalize path using fixenv's function or basic fallback."""
+    return fixenv_normalize_path(path)
+
+def sanitize_path(path: Union[str, Path]) -> str:
+    """Sanitize path using fixenv's function or basic fallback."""
+    return fixenv_sanitize_path(path)
 
 def validate_path_exists(path: str, context: str = "Dependency") -> None:
-    """
-    Checks if a file or sequence directory exists. Raises DependencyError if not.
-    """
-    # Use sanitize_path which should return an absolute, normalized path
-    abs_path_obj = Path(path)
-
-    # Check if it looks like a sequence pattern
+    """Checks if a file or sequence directory exists. Raises DependencyError if not."""
+    abs_path_str = sanitize_path(path) # Get absolute path first
+    abs_path_obj = Path(abs_path_str)
     is_seq = get_frame_padding_pattern(abs_path_str) is not None
-
     target_to_check = abs_path_obj.parent if is_seq else abs_path_obj
     check_type = "directory" if is_seq else "file"
 
     log.debug(f"Validating existence of {check_type}: {target_to_check} (Context: {context}, Original: '{path}')")
-
     exists = False
     try:
-        if is_seq:
-            exists = target_to_check.is_dir()
-        else:
-            exists = target_to_check.is_file()
+        if is_seq: exists = target_to_check.is_dir()
+        else: exists = target_to_check.is_file()
     except OSError as e:
         log.warning(f"OS error checking existence of {target_to_check}: {e}")
-        # Treat access errors as non-existent for safety? Or re-raise? Let's treat as not found.
         exists = False
 
     if not exists:
         error_msg = f"{context}: Required {check_type} not found at expected location: {target_to_check} (From original path: '{path}')"
         log.error(error_msg)
         raise DependencyError(error_msg)
-
     log.debug(f"Validation passed: {check_type} exists at {target_to_check}")
 
-
 def is_ltfs_safe(filename: str) -> bool:
-    """Check if a filename contains potentially problematic characters for LTFS/cross-platform."""
-    if not isinstance(filename, str): filename = str(filename) # Ensure string
-    if not filename: return True # Empty string is safe
+    """Check if a filename contains potentially problematic characters."""
+    if not isinstance(filename, str): filename = str(filename)
+    if not filename: return True
     match = re.search(constants.INVALID_FILENAME_CHARS, filename)
     if match:
-        log.warning(f"Potentially unsafe character '{match.group(0)}' found in filename: '{filename}'")
+        # Log only once per unique problematic filename? Could get noisy.
+        # log.warning(f"Potentially unsafe character '{match.group(0)}' found in filename: '{filename}'")
         return False
     return True
 
 def ensure_ltfs_safe(path_component: str) -> bool:
-    """Checks if a single path component (file or dir name) is safe. Logs error if not."""
+    """Checks if a single path component is safe. Logs error if not."""
     if not is_ltfs_safe(path_component):
-         # Error logged by is_ltfs_safe
+         log.error(f"Path component '{path_component}' contains invalid characters for LTFS/archive.")
          return False
     return True
 
-
-# --- Sequence Detection ---
+# --- Sequence Detection --- (Mostly unchanged, ensure normalize_path is used)
 def get_frame_padding_pattern(path: Union[str, Path]) -> Optional[str]:
-    """Detects common frame padding patterns (%0Xd, ####, $F variants)."""
-    path_str = normalize_path(path) # Use normalized path string
-    # Prioritize %0xd style
+    path_str = normalize_path(path) # Use normalized
     percent_match = re.search(r"(%0*(\d*)d)", path_str)
-    if percent_match:
-        return percent_match.group(1) # e.g., %04d, %d
-    # Check for #### (common Nuke/Houdini alternative)
-    if "####" in path_str:
-        return "####"
-    # Check for $F variants (e.g., $F, $F4)
-    # Match $F followed by optional digits
+    if percent_match: return percent_match.group(1)
+    if "####" in path_str: return "####"
     f_match = re.search(r"(\$F\d*)", path_str)
-    if f_match:
-        # If just $F, return $F. If $F4, return $F4.
-        return f_match.group(1)
-    # Add other patterns like <frame>, <UDIM> if needed
+    if f_match: return f_match.group(1)
     return None
 
 def is_sequence(path: Union[str, Path]) -> bool:
-    """Checks if the path likely represents a frame sequence based on common patterns."""
     return get_frame_padding_pattern(path) is not None
 
 def expand_sequence_path(path_pattern: Union[str, Path], frame_range: Tuple[int, int]) -> List[str]:
-    """
-    Expands a sequence path pattern into a list of file paths for a given range.
-    Supports %0Xd, ####, $F, $F<n>. Returns empty list on error.
-    """
     pattern_token = get_frame_padding_pattern(path_pattern)
-    if not pattern_token:
-        # If no pattern, but range given, maybe just return original path N times? No, return single.
-        log.debug(f"Path '{path_pattern}' is not a sequence pattern. Returning as single item.")
-        return [normalize_path(path_pattern)]
-
+    if not pattern_token: return [normalize_path(path_pattern)]
     paths = []
     try:
         start, end = frame_range
-        # Allow end < start, generate frames based on range direction? No, standard is start -> end.
-        if end < start:
-            log.warning(f"End frame {end} is less than start frame {start} for sequence '{path_pattern}'. Expanding only frame {start}.")
-            end = start # Clamp range to single frame if end < start
-
-        log.debug(f"Expanding sequence '{path_pattern}' from frame {start} to {end}")
-        path_str = normalize_path(path_pattern) # Use normalized string
-
-        padding = 4 # Default padding
-        num_format = "{frame:04d}" # Default format string
-
+        if end < start: end = start # Clamp range
+        path_str = normalize_path(path_pattern)
+        padding = 4; num_format = "{frame:04d}" # Defaults
         if pattern_token.startswith('%'):
-            match = re.match(r"%0*(\d*)d", pattern_token)
-            padding = int(match.group(1)) if match and match.group(1) else 4
-            num_format = f"{{frame:0{padding}d}}"
-            base_path = path_str.replace(pattern_token, num_format, 1) # Replace first occurrence
-        elif pattern_token == "####":
-            padding = 4
-            num_format = "{frame:04d}"
-            base_path = path_str.replace("####", num_format, 1)
-        elif pattern_token.startswith('$F'):
-             padding_str = pattern_token[2:]
-             padding = int(padding_str) if padding_str.isdigit() else 4
-             num_format = f"{{frame:0{padding}d}}"
-             base_path = path_str.replace(pattern_token, num_format, 1)
-        else:
-             log.error(f"Unsupported sequence pattern '{pattern_token}' in path '{path_str}'. Cannot expand.")
-             return [] # Return empty list on unsupported pattern
-
-        # Generate paths using f-string formatting for clarity
-        for i in range(start, end + 1):
-             # Use a dictionary for format() to make it explicit
-             frame_path = base_path.format(frame=i)
-             paths.append(frame_path)
-
-    except (ValueError, TypeError) as e:
-        log.error(f"Error formatting sequence path for frame number: {e}. Pattern='{pattern_token}', Path='{path_pattern}', Range={frame_range}")
-        return [] # Return empty list on formatting error
-    except Exception as e:
-        log.error(f"Unexpected error expanding sequence '{path_pattern}': {e}")
-        return []
-
+            match = re.match(r"%0*(\d*)d", pattern_token); padding = int(match.group(1)) if match and match.group(1) else 4; num_format = f"{{frame:0{padding}d}}"; base_path = path_str.replace(pattern_token, num_format, 1)
+        elif pattern_token == "####": padding = 4; num_format = "{frame:04d}"; base_path = path_str.replace("####", num_format, 1)
+        elif pattern_token.startswith('$F'): padding_str = pattern_token[2:]; padding = int(padding_str) if padding_str.isdigit() else 4; num_format = f"{{frame:0{padding}d}}"; base_path = path_str.replace(pattern_token, num_format, 1)
+        else: log.error(f"Unsupported pattern '{pattern_token}'"); return []
+        for i in range(start, end + 1): paths.append(base_path.format(frame=i))
+    except Exception as e: log.error(f"Error expanding sequence '{path_pattern}': {e}"); return []
     return paths
 
-
 def find_sequence_range_on_disk(path_pattern: Union[str, Path]) -> Optional[Tuple[int, int]]:
-    """
-    Tries to find the first and last frame number of a sequence present on disk
-    matching the provided pattern.
-    """
     pattern_token = get_frame_padding_pattern(path_pattern)
-    if not pattern_token:
-        log.debug(f"Path '{path_pattern}' is not a sequence pattern. Cannot scan disk.")
-        return None
-
+    if not pattern_token: return None
     try:
-        norm_pattern = normalize_path(path_pattern)
-        base_dir = Path(norm_pattern).parent
-
-        if not base_dir.is_dir():
-            log.warning(f"Directory for sequence pattern '{norm_pattern}' does not exist or is not a directory: {base_dir}")
-            return None
-
-        filename_pattern_part = Path(norm_pattern).name
-        # Split based on the detected token
-        parts = filename_pattern_part.split(pattern_token, 1)
-        file_prefix = parts[0]
-        file_suffix = parts[1] if len(parts) > 1 else ""
-
-        # Determine regex capture group based on pattern's padding
+        norm_pattern = normalize_path(path_pattern); base_dir = Path(norm_pattern).parent
+        if not base_dir.is_dir(): return None
+        filename_pattern_part = Path(norm_pattern).name; parts = filename_pattern_part.split(pattern_token, 1); file_prefix = parts[0]; file_suffix = parts[1] if len(parts) > 1 else ""
         padding = 4 # Default
-        if pattern_token.startswith('%'):
-            match = re.match(r"%0*(\d*)d", pattern_token)
-            padding = int(match.group(1)) if match and match.group(1) else 4
-        elif pattern_token == "####":
-            padding = 4
-        elif pattern_token.startswith('$F'):
-             padding_str = pattern_token[2:]
-             padding = int(padding_str) if padding_str.isdigit() else 4
-
-        # Regex to capture frame number digits (\d+) - be more specific with padding
-        # Capture exactly 'padding' digits
+        if pattern_token.startswith('%'): match = re.match(r"%0*(\d*)d", pattern_token); padding = int(match.group(1)) if match and match.group(1) else 4
+        elif pattern_token == "####": padding = 4
+        elif pattern_token.startswith('$F'): padding_str = pattern_token[2:]; padding = int(padding_str) if padding_str.isdigit() else 4
         frame_regex_part = rf"(\d{{{padding}}})"
-
-        # Escape regex special characters in prefix/suffix for safety
-        escaped_prefix = re.escape(file_prefix)
-        escaped_suffix = re.escape(file_suffix)
-        # Compile regex: ^ + prefix + digits + suffix + $
-        frame_regex = re.compile(rf"^{escaped_prefix}{frame_regex_part}{escaped_suffix}$")
-
+        escaped_prefix = re.escape(file_prefix); escaped_suffix = re.escape(file_suffix); frame_regex = re.compile(rf"^{escaped_prefix}{frame_regex_part}{escaped_suffix}$")
         frames = []
-        log.debug(f"Scanning directory '{base_dir}' with regex '{frame_regex.pattern}'")
         for item in base_dir.iterdir():
-            # Check if item is a file first to avoid errors on dirs/links
             if item.is_file():
                 match = frame_regex.match(item.name)
-                if match:
-                    try:
-                        # Extract the captured frame number (group 1)
-                        frame_num = int(match.group(1))
-                        frames.append(frame_num)
-                    except (ValueError, IndexError):
-                        # Log if conversion fails, but continue scanning
-                        log.warning(f"Could not parse frame number from matched file: {item.name}")
-                        continue
-
-        if not frames:
-            log.warning(f"No frames found on disk matching pattern '{norm_pattern}' in directory '{base_dir}'")
-            return None
-
-        min_frame, max_frame = min(frames), max(frames)
-        log.debug(f"Disk scan found range: {min_frame}-{max_frame}")
-        return min_frame, max_frame
-
-    except OSError as e:
-        log.error(f"OS error scanning directory or files for sequence '{path_pattern}': {e}")
-        return None
-    except Exception as e:
-        # Catch other potential errors (regex, path manipulation)
-        log.error(f"Unexpected error during sequence range disk scan for '{path_pattern}': {e}")
-        return None
-
+                if match: try: frames.append(int(match.group(1))) except (ValueError, IndexError): pass
+        if not frames: return None
+        return min(frames), max(frames)
+    except Exception as e: log.error(f"Error scanning disk for range '{path_pattern}': {e}"); return None
 
 def parse_frame_range(range_str: Optional[str]) -> Optional[Tuple[int, int]]:
-    """Parses frame range string like '1001-1100' or '1050'."""
-    if not range_str:
-        return None
-    range_str = str(range_str).strip() # Ensure string and remove whitespace
-    # Match single frame or range (allowing negative numbers)
-    match = re.match(r"^(-?\d+)(?:-(-?\d+))?$", range_str)
-    if not match:
-        raise ValueError(f"Invalid frame range format: '{range_str}'. Use 'start' or 'start-end'.")
-    try:
-        start = int(match.group(1))
-        end_str = match.group(2)
-        end = int(end_str) if end_str is not None else start # Use start if end is missing
-        # Allow end frame to be less than start frame (handled by expand_sequence)
-        # if end < start:
-        #    log.warning(f"End frame {end} is less than start frame {start} in provided range '{range_str}'.")
-        return start, end
-    except ValueError:
-        # Should not happen with regex match, but catch just in case
-        raise ValueError(f"Could not parse integers from frame range string: '{range_str}'")
-
+    if not range_str: return None
+    match = re.match(r"^(-?\d+)(?:-(-?\d+))?$", str(range_str).strip())
+    if not match: raise ValueError(f"Invalid frame range format: '{range_str}'.")
+    try: start = int(match.group(1)); end = int(match.group(2)) if match.group(2) is not None else start; return start, end
+    except ValueError: raise ValueError(f"Could not parse integers from range: '{range_str}'")
 
 # --- Nuke Interaction ---
 def get_nuke_executable() -> str:
-    """Finds the Nuke executable path based on OS and environment."""
-    # Select default based on current OS
-    if OS == OS_WIN:
-        nuke_path = NUKE_EXEC_PATH_WIN
-        # List of potential Nuke install locations on Windows
-        alternate_paths = [
-            "C:\\Program Files\\Nuke*\\Nuke*.exe",
-            "C:\\Program Files\\Foundry\\Nuke*\\Nuke*.exe"
-        ]
-    elif OS == OS_LIN:
-        nuke_path = NUKE_EXEC_PATH_LIN
-        # List of potential Nuke install locations on Linux
-        alternate_paths = [
-            "/usr/local/Nuke*/Nuke*",
-            "/opt/Nuke*/Nuke*",
-            "/opt/Foundry/Nuke*/Nuke*"
-        ]
-    elif OS == OS_MAC:
-        nuke_path = NUKE_EXEC_PATH_MAC
-        # List of potential Nuke install locations on Mac
-        alternate_paths = [
-            "/Applications/Nuke*.app/Contents/MacOS/Nuke*"
-        ]
-    else:
-        # Should not happen if OS detection works
-        raise EnvironmentError(f"Unsupported operating system '{OS}' for Nuke.")
+    """Finds the Nuke executable path."""
+    # Prioritize NUKE_EXE_PATH env var
+    nuke_path_env = os.getenv("NUKE_EXE_PATH")
+    if nuke_path_env:
+        nuke_path_env_obj = Path(nuke_path_env)
+        if nuke_path_env_obj.is_file():
+            log.debug(f"Using Nuke executable from NUKE_EXE_PATH: {nuke_path_env}")
+            return normalize_path(nuke_path_env)
+        else:
+            log.warning(f"NUKE_EXE_PATH ('{nuke_path_env}') does not point to a valid file. Checking defaults...")
 
-    # Validate the default path
-    if Path(nuke_path).is_file():
-        log.debug(f"Using default Nuke executable for {OS}: {nuke_path}")
-        return nuke_path
-    
-    log.warning(f"Nuke executable not found at default location: '{nuke_path}'. Trying alternate locations...")
-    
-    # Try checking alternate common install locations
-    import glob
-    for pattern in alternate_paths:
-        possible_paths = glob.glob(pattern)
-        if possible_paths:
-            # Sort to get the highest version
-            possible_paths.sort(reverse=True)
-            nuke_path = possible_paths[0]
-            log.info(f"Found Nuke executable at alternate location: {nuke_path}")
-            return nuke_path
-    
-    # Additional custom check: look for NUKE_PATH or NUKE_ROOT environment variables
-    for env_var in ["NUKE_EXE_PATH", "NUKE_PATH", "NUKE_ROOT"]:
-        env_path = os.environ.get(env_var)
-        if env_path:
-            log.info(f"Checking environment variable {env_var}={env_path}")
-            if Path(env_path).is_file() and "nuke" in env_path.lower():
-                log.info(f"Using Nuke executable from {env_var}: {env_path}")
-                return env_path
-            elif Path(env_path).is_dir():
-                # If it's a directory, look for nuke executable inside
-                possible_execs = list(Path(env_path).glob("**/Nuke*.exe" if OS == OS_WIN else "**/Nuke*"))
-                if possible_execs:
-                    nuke_path = str(possible_execs[0])
-                    log.info(f"Found Nuke executable in {env_var} directory: {nuke_path}")
-                    return nuke_path
-    
-    # If we get here, we failed to find Nuke
-    raise ConfigurationError(
-        f"Nuke executable not found at default location: '{nuke_path}' or any alternate locations. "
-        f"Please ensure Nuke is installed correctly or set the NUKE_EXE_PATH environment variable. "
-        f"Expected locations on {OS} include: {', '.join(alternate_paths)}"
-    )
+    # Fallback to defaults based on OS
+    if OS == OS_WIN: default_path = constants.DEFAULT_NUKE_EXECUTABLE_WIN
+    elif OS == OS_LIN: default_path = constants.DEFAULT_NUKE_EXECUTABLE_LIN
+    elif OS == OS_MAC: default_path = constants.DEFAULT_NUKE_EXECUTABLE_MAC
+    else: raise EnvironmentError(f"Unsupported OS '{OS}' for Nuke.")
 
+    if Path(default_path).is_file():
+        log.debug(f"Using default Nuke executable for {OS}: {default_path}")
+        return normalize_path(default_path)
 
-# Path to the nuke_ops.py script within this package
-NUKE_OPS_SCRIPT_PATH = Path(__file__).parent / "nuke_ops.py"
+    # If default not found, raise error (could add more search logic here if needed)
+    raise ConfigurationError(f"Nuke executable not found at default location: '{default_path}'. Set the NUKE_EXE_PATH environment variable.")
 
-def run_nuke_action(actions: List[str],
-                    script_path: Optional[str] = None,
-                    target_nodes: Optional[List[str]] = None,
-                    node_name: Optional[str] = None,
-                    output_path: Optional[str] = None,
-                    frame_range: Optional[Tuple[int, int]] = None,
-                    timeout: int = 120) -> Dict[str, Any]:
+# Path to the internal Nuke script relative to this utils file
+_NUKE_EXECUTOR_SCRIPT_PATH = Path(__file__).parent / constants.NUKE_EXECUTOR_SCRIPT_NAME
+
+def execute_nuke_archive_process(
+    input_script_path: str,
+    archive_root: str,
+    final_script_archive_path: str,
+    metadata: Dict[str, Any],
+    bake_gizmos: bool,
+    repath_script_flag: bool,
+    timeout: int = 300 # Increased default timeout for potentially long process
+) -> Dict[str, Any]:
     """
-    Runs the nuke_ops.py script via 'nuke -t' to perform specific actions.
+    Executes the _nuke_executor.py script via 'nuke -t'. This performs the
+    entire Nuke-side process: load, prune, dep collection, bake, repath, save.
 
     Args:
-        actions: List of actions to perform (e.g., ['get_writes', 'get_deps']).
-        script_path: Path to the Nuke script to load (if required by actions).
-        target_nodes: List of node names (if required by actions).
-        node_name: Single node name (if required by action).
-        output_path: Output file path (if required by actions).
-        frame_range: Optional tuple (start, end) for frame range override.
-        timeout: Timeout in seconds for the Nuke process (default reduced to 120).
+        input_script_path: Absolute path to the original Nuke script.
+        archive_root: Absolute path to the archive destination root.
+        final_script_archive_path: Absolute path where the processed script should be saved.
+        metadata: Dictionary containing vendor, show, episode, shot, etc.
+        bake_gizmos: Boolean flag passed to Nuke script.
+        repath_script_flag: Boolean flag passed to Nuke script.
+        timeout: Timeout in seconds for the entire Nuke process.
 
     Returns:
-        Dictionary containing the results or errors parsed from the Nuke script's JSON output.
+        Dictionary containing the results parsed from the Nuke script's JSON output.
+        Expected keys: 'status', 'final_saved_script_path', 'dependencies_to_copy', 'errors'.
 
     Raises:
-        ConfigurationError: If Nuke executable or nuke_ops.py script not found.
-        ArchiveError: If the Nuke process fails critically or returns errors indicating failure.
-        subprocess.TimeoutExpired: If the process times out.
-        FileNotFoundError: If nuke_ops.py script is missing.
+        ConfigurationError: If Nuke executable or executor script not found.
+        NukeExecutionError: If the Nuke process fails critically (timeout, crash, non-zero exit).
         ParsingError: If the JSON output from Nuke cannot be parsed.
     """
     nuke_exe = get_nuke_executable() # Raises ConfigurationError if not found
 
-    if not NUKE_OPS_SCRIPT_PATH.is_file():
-        raise FileNotFoundError(f"Core Nuke operations script missing at: {NUKE_OPS_SCRIPT_PATH}")
+    if not _NUKE_EXECUTOR_SCRIPT_PATH.is_file():
+        raise FileNotFoundError(f"Core Nuke executor script missing: {_NUKE_EXECUTOR_SCRIPT_PATH}")
 
-    # Build the command line arguments for Nuke
-    command = [nuke_exe, "-t", str(NUKE_OPS_SCRIPT_PATH)] # -t for terminal mode
-    command.extend(["--action"] + actions) # Specify action(s)
+    # Serialize metadata to JSON string for command line argument
+    try:
+        metadata_json_string = json.dumps(metadata)
+    except TypeError as e:
+        raise ConfigurationError(f"Metadata dictionary cannot be serialized to JSON: {e}") from e
 
-    # Add optional arguments only if they have a value
-    if script_path:
-        command.extend(["--script-path", normalize_path(script_path)])
-    if target_nodes: # Pass even if empty list? No, only if non-empty.
-        command.extend(["--target-nodes"] + target_nodes)
-    if node_name:
-        command.extend(["--node-name", node_name])
-    if output_path:
-        command.extend(["--output-path", normalize_path(output_path)])
-    if frame_range:
-        # Format frame range tuple as "start-end" string for argparse
-        command.extend(["--frame-range", f"{frame_range[0]}-{frame_range[1]}"])
+    # Build the command line arguments
+    command = [
+        nuke_exe,
+        "-t", # Terminal mode
+        str(_NUKE_EXECUTOR_SCRIPT_PATH),
+        "--input-script-path", normalize_path(input_script_path),
+        "--archive-root", normalize_path(archive_root),
+        "--final-script-archive-path", normalize_path(final_script_archive_path),
+        "--metadata-json", metadata_json_string,
+    ]
+    if bake_gizmos: command.append("--bake-gizmos")
+    if repath_script_flag: command.append("--repath-script")
+    # Add other necessary arguments here if _nuke_executor expects them
 
-    log.info(f"Running Nuke command with {timeout}s timeout: {' '.join(command)}")
-    full_output = "" # Initialize variable to store output for debugging on error
+    log.info(f"Executing Nuke process with {timeout}s timeout...")
+    log.debug(f"Nuke Command: {' '.join(command)}") # Log full command at debug
+    full_stdout = ""
+    full_stderr = ""
+    start_time = time.time()
 
     try:
-        # Log start time
-        start_time = time.time()
-        log.debug(f"Nuke process starting at: {datetime.datetime.now().strftime('%H:%M:%S')}")
-        
-        # Execute the command with timeout using subprocess.run
-        # This is a simpler approach that works on Windows
+        # Use Popen for potentially better handling of large output / interactivity if needed later
+        # For now, stick with run for simplicity, but increase buffer size if output truncated?
         process = subprocess.run(
             command,
             capture_output=True,
             text=True,
-            check=False,
+            check=False, # Handle exit code manually
             timeout=timeout,
             encoding='utf-8',
-            errors='replace'
+            errors='replace' # Handle potential weird characters in Nuke output
         )
-        
-        # Calculate elapsed time
         elapsed = time.time() - start_time
-        
-        # Store combined output for potential debugging
-        stdout_output = process.stdout
-        stderr_output = process.stderr
+        full_stdout = process.stdout or ""
+        full_stderr = process.stderr or ""
         returncode = process.returncode
-        
+
         log.debug(f"Nuke process finished after {elapsed:.1f}s. Exit Code: {returncode}")
-        full_output = f"--- Nuke stdout ---\n{stdout_output}\n\n--- Nuke stderr ---\n{stderr_output}"
+        # Log stdout/stderr only if they contain data, trim whitespace
+        if full_stdout.strip(): log.debug(f"Nuke stdout:\n{full_stdout.strip()}")
+        if full_stderr.strip(): log.warning(f"Nuke stderr:\n{full_stderr.strip()}") # Log stderr as warning
 
-        # Log the full raw output only at DEBUG level to avoid cluttering logs
-        if full_output.strip():
-            log.debug(f"Nuke Raw Output (stdout & stderr):\n{full_output.strip()}")
-
-        # --- Process Results ---
-        # Even if exit code is non-zero, try parsing stdout for potential error messages from nuke_ops.py
-        results = {}
+        # --- Parse JSON Output ---
+        # Expect JSON to be the *last* significant output on stdout
         try:
-            results = _parse_nuke_ops_output(stdout_output) # Try parsing JSON from stdout
+            results = _parse_nuke_executor_output(full_stdout)
         except ParsingError as pe:
-            # Parsing failed, log error but check exit code before raising fully
-            log.error(f"Failed to parse JSON results from Nuke stdout: {pe}")
+            log.error(f"Failed to parse JSON results from Nuke process: {pe}")
+            # If parsing fails, check exit code and stderr for clues
             if returncode != 0:
-                # Nuke failed *and* output is unparseable - raise critical error
-                error_message = f"Nuke process failed (Exit Code {returncode}) and output parsing error: {pe}."
-                log.error(error_message)
-                # Include stderr for context if available
-                if stderr_output.strip():
-                     error_message += f"\nNuke stderr: {stderr_output.strip()[:1000]}..." # Limit length
-                raise ArchiveError(error_message) from pe
+                 err_msg = f"Nuke process failed (Exit Code {returncode}) and output parsing error: {pe}."
             else:
-                 # Nuke exited cleanly but output unparseable - strange, raise parsing error
-                 raise pe
+                 err_msg = f"Nuke process finished successfully (Exit Code 0) but output parsing failed: {pe}."
+            if full_stderr.strip(): err_msg += f"\nStderr: {full_stderr.strip()[:500]}..."
+            raise NukeExecutionError(err_msg) from pe
 
-        # Check for critical errors reported within the parsed JSON results
-        if results.get("fatal_error"):
-             log.error(f"Nuke script reported fatal error: {results['fatal_error']}")
-             raise ArchiveError(f"Fatal error during Nuke execution: {results['fatal_error']}")
-        if results.get("load_error"):
-             log.error(f"Nuke script failed to load input script: {results['load_error']}")
-             raise ArchiveError(f"Nuke failed to load script: {results['load_error']}")
+        # --- Check Results and Exit Code ---
+        if results.get("status") != "success" or returncode != 0:
+             error_list = results.get("errors", [])
+             # If Nuke crashed hard, error list might be empty, use stderr
+             if not error_list and returncode != 0: error_list.append(f"Nuke process exited with code {returncode}.")
+             if full_stderr.strip(): error_list.append(f"Stderr: {full_stderr.strip()[:500]}...")
 
-        # If Nuke process had non-zero exit code, but we parsed results, treat as failure but return results
-        if returncode != 0:
-            error_message = f"Nuke process execution failed (Exit Code {returncode}) for actions: {actions}."
-            log.error(error_message)
-            results['execution_error'] = error_message # Add flag to results
-            # Check if specific action errors were also reported
-            action_errors = {k:v for k,v in results.items() if k.endswith('_error') and v}
-            if action_errors: log.error(f"Specific action errors reported: {action_errors}")
-            # Return results dictionary containing the error flags/messages
-            return results
+             final_error_message = f"Nuke process reported failure (Status: {results.get('status', 'unknown')}, Exit Code: {returncode}). Errors: {' || '.join(error_list)}"
+             log.error(final_error_message)
+             raise NukeExecutionError(final_error_message, results=results) # Include parsed results if available
 
-        # If exit code 0 and parsing successful, check for non-fatal action errors
-        action_errors = {k:v for k,v in results.items() if k.endswith('_error') and v and k != 'execution_error'}
-        if action_errors:
-            log.warning(f"Nuke process completed, but reported non-fatal errors during actions: {action_errors}")
-            # Proceed, but caller should be aware of these warnings
-
-        log.info(f"Nuke action(s) '{actions}' completed successfully.")
-        return results # Return the parsed dictionary
+        # If status is success and exit code is 0
+        log.info(f"Nuke processing completed successfully in {elapsed:.1f}s.")
+        return results
 
     except FileNotFoundError:
-        # This catches if the nuke_exe itself wasn't found by subprocess.run
-        raise ConfigurationError(f"Nuke executable not found or permission denied at '{nuke_exe}'. Please ensure Nuke is installed and accessible.") from None
+        # Occurs if nuke_exe path is wrong or nuke isn't installed/in PATH
+        raise ConfigurationError(f"Nuke executable not found or permission denied at '{nuke_exe}'.") from None
     except subprocess.TimeoutExpired:
-        log.error(f"Nuke process timed out after {timeout} seconds for actions: {actions}.")
-        log.debug(f"Nuke Raw Output on Timeout:\n{full_output.strip()}") # Log captured output
-        raise # Re-raise TimeoutExpired
+        log.error(f"Nuke process timed out after {timeout} seconds.")
+        # Log captured output if available
+        if full_stdout.strip(): log.debug(f"Nuke stdout on Timeout:\n{full_stdout.strip()}")
+        if full_stderr.strip(): log.warning(f"Nuke stderr on Timeout:\n{full_stderr.strip()}")
+        raise NukeExecutionError(f"Nuke process timed out after {timeout} seconds.") from None
     except Exception as e:
-        # Catch any other unexpected errors during subprocess handling or result processing
-        log.exception(f"An unexpected error occurred running Nuke action '{actions}': {e}")
-        log.debug(f"Nuke Raw Output on Error:\n{full_output.strip()}") # Log captured output
-        # Wrap in ArchiveError for consistent exception type
-        raise ArchiveError(f"Failed to run Nuke action '{actions}': {e}") from e
+        # Catch any other unexpected errors (e.g., subprocess issues)
+        log.exception(f"An unexpected error occurred running Nuke: {e}")
+        if full_stdout.strip(): log.debug(f"Nuke stdout on Error:\n{full_stdout.strip()}")
+        if full_stderr.strip(): log.warning(f"Nuke stderr on Error:\n{full_stderr.strip()}")
+        raise ArchiveError(f"Failed to execute Nuke process: {e}") from e
 
 
-def _parse_nuke_ops_output(output: str) -> Dict[str, Any]:
-    """Helper to extract the final JSON results from nuke_ops.py stdout."""
-    json_start_tag = "--- NUKE OPS FINAL RESULTS ---"
+def _parse_nuke_executor_output(output: str) -> Dict[str, Any]:
+    """Helper to extract the final JSON results block from _nuke_executor.py stdout."""
+    json_start_tag = "--- NUKE EXECUTOR FINAL RESULTS ---"
     json_string = ""
     try:
         # Find the *last* occurrence of the start tag
         json_start_index = output.rindex(json_start_tag)
-        # Extract everything after the start tag
-        json_string_with_trailer = output[json_start_index + len(json_start_tag):].strip()
+        # Extract JSON string part
+        json_part = output[json_start_index + len(json_start_tag):]
+        # Find the first opening brace '{' which marks the start of our JSON object
+        json_obj_start = json_part.find('{')
+        if json_obj_start == -1:
+             raise ValueError("Could not find start of JSON object ('{') after result tag.")
+        # Find the matching closing brace '}' - this is tricky if JSON is nested
+        # Simple approach: find last closing brace
+        json_obj_end = json_part.rfind('}')
+        if json_obj_end == -1 or json_obj_end < json_obj_start:
+             raise ValueError("Could not find end of JSON object ('}') after result tag.")
 
-        # Clean potential trailing script end tag if present
-        json_end_tag = "--- NUKE OPS SCRIPT END ---"
-        if json_end_tag in json_string_with_trailer:
-             json_string = json_string_with_trailer.split(json_end_tag)[0].strip()
-        else:
-             # If end tag isn't there, maybe process finished abruptly? Use whole string.
-             json_string = json_string_with_trailer
+        # Extract the potential JSON string
+        json_string = json_part[json_obj_start : json_obj_end + 1].strip()
 
-        # Handle case where output might be just tags or empty after tags
         if not json_string:
-             log.warning("No JSON content found after result tag in Nuke output.")
-             # Check output *before* the tag for errors if content is missing
-             output_before_tag = output[:json_start_index] if json_start_index > 0 else output
-             if "error" in output_before_tag.lower() or "traceback" in output_before_tag.lower():
-                  log.error("Error messages detected in Nuke output before missing JSON results.")
-                  # Raise parsing error with hint
-                  raise ParsingError("No JSON content found, errors detected in Nuke log before results tag.")
-             return {} # Return empty dict if no content and no obvious prior errors
+             raise ValueError("JSON results section is empty after extraction.")
 
-        # Attempt to parse the extracted JSON string
         parsed_json = json.loads(json_string)
-        log.debug("Successfully parsed JSON results from Nuke output.")
+        log.debug("Successfully parsed JSON results from Nuke executor output.")
         return parsed_json
-
-    except ValueError as e: # Catches rindex not found or json.JSONDecodeError
-        log.error(f"Failed to find result tag or parse JSON from Nuke output: {e}")
-        # Log context around the failure point
+    except ValueError as e: # Catches rindex not found, brace finding errors, or json.JSONDecodeError
+        log.error(f"Failed to find or parse JSON results from Nuke output: {e}")
         log.debug(f"Full Nuke Output for Parsing Debug:\n{output.strip()}")
         if json_start_tag in output:
-             log.debug(f"Problematic JSON String Candidate Tried:\n{json_string}")
-        # Raise specific ParsingError
-        raise ParsingError(f"Could not retrieve valid JSON results from Nuke: {e}") from e
+             log.debug(f"Problematic String Segment Tried:\n{json_string if json_string else 'N/A'}")
+        raise ParsingError(f"Could not retrieve valid JSON results from Nuke executor: {e}") from e
 
+# --- Robust File Copying ---
+def copy_files_robustly(
+    dependencies_to_copy: Dict[str, Optional[str]], # {source_abs: dest_abs_or_None}
+    dry_run: bool = False
+) -> Tuple[int, int]:
+    """
+    Copies files listed in the dependency map using robocopy (Win) or rsync (Lin/Mac)
+    with shutil fallback. Handles sequences.
 
-# --- File System Operations ---
-def copy_file_or_sequence(source_path: str, dest_path: str, frame_range: Optional[Tuple[int, int]], dry_run: bool = False) -> List[Tuple[str, str]]:
+    Args:
+        dependencies_to_copy: Dictionary mapping absolute source paths to absolute
+                              destination paths (value is None if destination invalid).
+        dry_run: If True, simulate copy operations.
+
+    Returns:
+        Tuple (success_count, failure_count)
     """
-    Copies a single file or an entire sequence. Uses shutil.copy2.
-    Returns list of (source, destination) pairs copied or simulated.
-    Raises errors on failure to create directories or copy critical files.
-    Logs warnings for missing sequence frames but attempts to continue.
-    """
-    copied_pairs = []
-    start_time = time.time()
-    try:
+    success_count = 0
+    failure_count = 0
+    total_expected = len(dependencies_to_copy)
+    log.info(f"Starting robust file copy process for {total_expected} dependency entries...")
+    processed_sequences = set() # Track sequence patterns already handled
+
+    for index, (source_path, dest_path) in enumerate(dependencies_to_copy.items()):
+
+        log.debug(f"Processing copy item {index+1}/{total_expected}: {source_path} -> {dest_path}")
+
+        if not source_path: # Should not happen if map generated correctly
+            log.warning("Skipping copy item with no source path.")
+            failure_count += 1
+            continue
+        if not dest_path:
+            log.warning(f"Skipping copy for '{source_path}': Invalid or missing destination path.")
+            failure_count += 1
+            continue
+
         norm_source = normalize_path(source_path)
         norm_dest = normalize_path(dest_path)
-        is_seq = is_sequence(norm_source) # Check based on normalized source path pattern
-        target_dir = Path(norm_dest).parent
 
-        # --- Ensure Target Directory Exists ---
+        is_seq = is_sequence(norm_source)
+        source_pattern_or_file = norm_source if is_seq else Path(norm_source)
+        dest_dir = Path(norm_dest).parent
+        dest_pattern_or_file = norm_dest
+
+        # Skip sequences if the pattern was already processed
+        if is_seq and source_pattern_or_file in processed_sequences:
+             log.debug(f"Skipping already processed sequence pattern: {source_pattern_or_file}")
+             continue
+
+        # Ensure destination directory exists (create if needed, handle errors)
         if dry_run:
-            # Only log simulation if directory doesn't already exist
-            if not target_dir.exists():
-                 log.info(f"[DRY RUN] Would ensure directory exists: {target_dir}")
+             if not dest_dir.exists(): log.info(f"[DRY RUN] Would ensure directory exists: {dest_dir}")
         else:
-            try:
-                # Create directory if it doesn't exist
-                if not target_dir.exists():
-                     log.debug(f"Creating target directory: {target_dir}")
-                     target_dir.mkdir(parents=True, exist_ok=True)
-                elif not target_dir.is_dir():
-                     # Path exists but isn't a directory - critical error
-                     raise ArchiverError(f"Target path '{target_dir}' exists but is not a directory.")
-            except OSError as e:
-                # Catch permission errors, etc.
-                raise ArchiverError(f"Failed to create target directory '{target_dir}': {e}") from e
+             try:
+                 dest_dir.mkdir(parents=True, exist_ok=True)
+             except OSError as e:
+                 log.error(f"Failed to create destination directory '{dest_dir}' for '{norm_source}': {e}")
+                 failure_count += 1
+                 if is_seq: processed_sequences.add(source_pattern_or_file) # Mark as failed
+                 continue # Skip this item/sequence
 
-        # --- Check for existing destination ---
-        if not dry_run and Path(norm_dest).exists() and not is_seq:
-            log.warning(f"Destination file already exists: {norm_dest}. Will be overwritten.")
-            
-        # --- Perform Copy ---
-        if is_seq:
-            # --- Sequence Copy ---
-            if not frame_range: # Frame range is mandatory for sequence copy now
-                raise ValueError(f"Frame range must be provided to copy sequence: {norm_source}")
-            if not isinstance(frame_range, tuple) or len(frame_range) != 2 or not all(isinstance(f, int) for f in frame_range):
-                 raise ValueError(f"Invalid frame_range format: {frame_range}. Expected (start_int, end_int).")
+        # --- Perform Copy Operation ---
+        copy_command = []
+        use_shutil_fallback = False
 
-            source_files = expand_sequence_path(norm_source, frame_range)
-            dest_files = expand_sequence_path(norm_dest, frame_range) # Expand dest using same range
+        try:
+            # --- Build Command (Robocopy/Rsync) ---
+            if OS == OS_WIN:
+                 # Robocopy - Basic options: /E (subdirs), /COPY:DAT (data, attrs, times), /R:3 (retries), /W:5 (wait)
+                 # /NJH (no header), /NJS (no summary), /NP (no progress), /NDL (no dir logging) - adjust for desired output
+                 # For sequences, copy individual files. Robocopy better for dirs.
+                 if not is_seq:
+                      # Copy single file: robocopy <SourceDir> <DestDir> <FileName> [options]
+                      src_dir = str(Path(norm_source).parent)
+                      src_file = Path(norm_source).name
+                      command = ['robocopy', src_dir, str(dest_dir), src_file, '/COPY:DAT', '/R:2', '/W:3', '/NJH', '/NJS', '/NP', '/NDL']
+                      # Add /IS to include same files (overwrite)
+                      if Path(norm_dest).exists(): command.append('/IS')
+                      copy_command = command
+                 else:
+                      use_shutil_fallback = True # Robocopy less ideal for frame-by-frame of sequences
+            elif OS == OS_LIN or OS == OS_MAC:
+                 # Rsync - Basic options: -a (archive), -v (verbose), --progress
+                 # Handle sequences carefully. Rsync good for dirs or specific files.
+                 if not is_seq:
+                      # Copy single file: rsync [options] <SourceFile> <DestFile>
+                      command = ['rsync', '-t', '--progress', norm_source, norm_dest] # -t preserves times
+                      copy_command = command
+                 else:
+                      use_shutil_fallback = True # Rsync less ideal for specific frame ranges unless generating file list
 
-            if not source_files:
-                 raise DependencyError(f"Failed to expand source sequence path '{norm_source}' for range {frame_range}.")
-            if len(source_files) != len(dest_files):
-                 raise ArchiverError(f"Sequence length mismatch: Source expansion ({len(source_files)}) != Dest expansion ({len(dest_files)}). Src='{norm_source}', Dst='{norm_dest}'")
-
-            total_frames = len(source_files)
-            log.info(f"Processing sequence '{Path(norm_source).name}' ({total_frames} frames from {frame_range[0]} to {frame_range[1]})...")
-            frames_copied_count = 0
-            frames_skipped_count = 0
-            copy_errors = []
-            
-            # Progress reporting thresholds
-            report_interval = max(1, min(100, total_frames // 10))  # Report at 10% intervals
-            last_report_time = time.time()
-            
-            for i, (src_frame_path, dst_frame_path) in enumerate(zip(source_files, dest_files)):
-                # Progress reporting
-                if i % report_interval == 0 or i == total_frames - 1 or time.time() - last_report_time > 5:
-                    percent_done = (i / total_frames) * 100
-                    elapsed = time.time() - start_time
-                    if elapsed > 0 and i > 0:
-                        frames_per_sec = i / elapsed
-                        est_remaining = (total_frames - i) / frames_per_sec if frames_per_sec > 0 else 0
-                        log.info(f"Sequence progress: {i}/{total_frames} frames ({percent_done:.1f}%) - "
-                                 f"{frames_per_sec:.1f} frames/sec, ~{est_remaining:.1f}s remaining")
-                    else:
-                        log.info(f"Sequence progress: {i}/{total_frames} frames ({percent_done:.1f}%)")
-                    last_report_time = time.time()
-                
-                norm_src_frame = normalize_path(src_frame_path)
-                norm_dst_frame = normalize_path(dst_frame_path)
-                if dry_run:
-                    # Simulate validation and copy
-                    log.debug(f"[DRY RUN] Would validate and copy: {norm_src_frame} -> {norm_dst_frame}")
-                    # Assume validation passes in dry run for reporting
-                    copied_pairs.append((norm_src_frame, norm_dst_frame))
-                    frames_copied_count += 1
-                else:
-                    try:
-                        # Validate source frame exists just before copying
-                        src_frame_obj = Path(norm_src_frame)
-                        if not src_frame_obj.is_file():
-                             # Log clearly that frame is missing and skip
-                             log.warning(f"Skipping missing sequence frame: {norm_src_frame}")
-                             frames_skipped_count += 1
-                             continue # Go to next frame
-
-                        # Check if destination already exists
-                        if Path(norm_dst_frame).exists():
-                            log.debug(f"Destination frame already exists, overwriting: {norm_dst_frame}")
-                            
-                        # Check source file size
-                        src_size = src_frame_obj.stat().st_size
-                        if src_size == 0:
-                            log.warning(f"Source frame has zero size: {norm_src_frame}")
-                                
-                        # Copy with progress tracking for large files (over 100MB)
-                        if src_size > 100 * 1024 * 1024:
-                            log.info(f"Copying large frame ({src_size/1024/1024:.1f} MB): {norm_src_frame}")
-                            
-                        shutil.copy2(norm_src_frame, norm_dst_frame) # copy2 preserves metadata
-                        
-                        # Verify the copy succeeded and file sizes match
-                        if Path(norm_dst_frame).exists():
-                            dst_size = Path(norm_dst_frame).stat().st_size
-                            if dst_size != src_size:
-                                log.warning(f"Size mismatch after copy: Source={src_size} bytes, Dest={dst_size} bytes")
-                                
-                        copied_pairs.append((norm_src_frame, norm_dst_frame))
-                        frames_copied_count += 1
-                    except Exception as e:
-                        # Catch specific copy errors (permissions, disk full, network issues)
-                        error_msg = f"Failed to copy sequence frame {norm_src_frame} to {norm_dst_frame}: {e}"
-                        log.error(error_msg)
-                        copy_errors.append(error_msg)
-                        frames_skipped_count += 1 # Count errors as skipped
-                        
-                        # If we have multiple consecutive errors, maybe there's a systemic problem
-                        if len(copy_errors) >= 3 and all(error_msg in e for e in copy_errors[-3:]):
-                            log.error("Multiple consecutive similar errors detected, may indicate a systemic problem")
-                        
-            total_time = time.time() - start_time
-            frames_per_sec = frames_copied_count / total_time if total_time > 0 else 0
-            log.info(f"Sequence copy complete: {frames_copied_count} frames copied, {frames_skipped_count} frames skipped in {total_time:.1f}s ({frames_per_sec:.1f} frames/sec)")
-            
-            # If ALL frames failed or were skipped, raise an error
-            if frames_copied_count == 0 and (frames_skipped_count > 0 or copy_errors):
-                 raise DependencyError(f"Failed to copy any frames for sequence '{norm_source}'. {frames_skipped_count} frames missing/skipped. First error: {copy_errors[0] if copy_errors else 'All frames missing'}")
-            elif copy_errors and frames_copied_count < total_frames * 0.9:  # If less than 90% copied successfully
-                 # Raise error for significant failures
-                 raise ArchiverError(f"Only copied {frames_copied_count}/{total_frames} frames for sequence '{norm_source}'. Encountered {len(copy_errors)} errors. First error: {copy_errors[0]}")
-            elif copy_errors:
-                 # Just log a warning if most frames copied successfully
-                 log.warning(f"Copied {frames_copied_count}/{total_frames} frames with {len(copy_errors)} errors for sequence '{norm_source}'")
-
-        else:
-            # --- Single File Copy ---
-            if dry_run:
-                log.info(f"[DRY RUN] Would validate and copy single file: {norm_source} -> {norm_dest}")
-                copied_pairs.append((norm_source, norm_dest))
+            # --- Execute Command or Fallback ---
+            if copy_command and not use_shutil_fallback:
+                 if dry_run:
+                      log.info(f"[DRY RUN] Would execute: {' '.join(copy_command)}")
+                      success_count += 1 # Assume success for dry run simulation
+                 else:
+                      log.info(f"Executing copy command: {' '.join(copy_command)}")
+                      # Run the command
+                      copy_process = subprocess.run(copy_command, capture_output=True, text=True, check=False)
+                      if copy_process.returncode > 1: # Robocopy uses codes 0-1 for success
+                           log.error(f"Copy command failed for '{norm_source}' (Code: {copy_process.returncode}):")
+                           if copy_process.stdout: log.error(f"stdout: {copy_process.stdout.strip()}")
+                           if copy_process.stderr: log.error(f"stderr: {copy_process.stderr.strip()}")
+                           failure_count += 1
+                      else:
+                           log.info(f"Successfully copied '{norm_source}' using external tool.")
+                           success_count += 1
             else:
-                try:
-                    # Validate source file exists just before copy
-                    validate_path_exists(norm_source, "Single file dependency") # Will raise if not found
-                    
-                    # Check file size for large file logging
-                    src_size = Path(norm_source).stat().st_size
-                    if src_size > 100 * 1024 * 1024:  # 100MB
-                        log.info(f"Copying large file ({src_size/1024/1024:.1f} MB): {norm_source} -> {norm_dest}")
-                    else:
-                        log.debug(f"Copying single file ({src_size/1024:.1f} KB): {norm_source} -> {norm_dest}")
-                        
-                    shutil.copy2(norm_source, norm_dest)
-                    
-                    # Verify the copy succeeded
-                    if Path(norm_dest).exists():
-                        dst_size = Path(norm_dest).stat().st_size
-                        if dst_size != src_size:
-                            log.warning(f"Size mismatch after copy: Source={src_size} bytes, Dest={dst_size} bytes")
-                    
-                    copied_pairs.append((norm_source, norm_dest))
-                    total_time = time.time() - start_time
-                    log.debug(f"File copy completed in {total_time:.2f}s")
-                except (DependencyError, Exception) as e:
-                    # Re-raise errors during single file copy as ArchiverError
-                    raise ArchiverError(f"Failed to copy file {norm_source} to {norm_dest}: {e}") from e
-
-        return copied_pairs
-
-    except Exception as e:
-         # Catch unexpected errors in the setup phase (path normalization etc.)
-         log.exception(f"Unexpected error during setup for copy operation: {source_path} -> {dest_path}")
-         raise ArchiverError(f"Setup failed for copy: {e}") from e
+                 # Use Shutil Fallback (especially for sequences)
+                 log.debug(f"Using shutil fallback for: {norm_source}")
+                 # Need frame range if sequence
+                 frame_range = None
+                 if is_seq:
+                      # This info isn't passed here easily - need to get it from manifest again?
+                      # Workaround: Scan disk again here if needed. Very inefficient.
+                      # BEST: Nuke process should return range info with dependencies_to_copy map.
+                      # Assuming for now copy_file_or_sequence can handle it (needs refactor there)
+                      log.warning(f"Cannot determine frame range for shutil fallback on sequence: {norm_source}. Copy may fail or be incomplete.")
+                      # Try scanning disk as fallback
+                      frame_range = find_sequence_range_on_disk(norm_source)
+                      if not frame_range:
+                           raise DependencyError(f"Frame range needed for shutil sequence copy of '{norm_source}' but could not be determined.")
 
 
-# --- Metadata Extraction ---
+                 copied_pairs = copy_file_or_sequence(norm_source, norm_dest, frame_range, dry_run)
+                 if not dry_run and not copied_pairs:
+                      # Indicates failure within copy_file_or_sequence
+                      log.error(f"Shutil copy failed for: {norm_source}")
+                      failure_count += 1
+                 else:
+                      success_count += len(copied_pairs) if is_seq else 1 # Count frames or single file
+
+            # Mark sequence pattern as processed after attempting copy
+            if is_seq:
+                 processed_sequences.add(source_pattern_or_file)
+
+        except (DependencyError, ArchiverError, Exception) as e:
+             log.error(f"Failed to process copy item '{norm_source}' -> '{norm_dest}': {e}")
+             failure_count += 1
+             if is_seq: processed_sequences.add(source_pattern_or_file) # Mark as failed
+
+    log.info(f"Robust copy process finished. Success: {success_count}, Failures: {failure_count}")
+    # Note: success_count might represent frames for sequences when using shutil
+    return success_count, failure_count
+
+
+# --- Metadata Extraction Wrapper ---
 def get_metadata_from_path(script_path: str) -> Dict[str, Any]:
-    """
-    Uses fixfx.data.StudioData (if available) to attempt extracting metadata.
-    Returns an empty dict if parsing fails, path is not recognized, or fixfx is unavailable.
-    """
-    try:
-        # Import locally to reduce startup impact and handle missing dependency gracefully
-        from fixfx.data.studio_data import StudioData
-        from fixfx.data import _patterns # Import patterns to get list of properties
-
-        log.debug(f"Attempting metadata extraction from path: {script_path}")
-        sd = StudioData(script_path) # Raises ValueError if no pattern matches
-
-        # Extract only the named groups captured by the matching pattern
-        metadata = {}
-        if hasattr(sd, '_match') and sd._match:
-             # Use groupdict from the match object for accuracy
-             metadata = {k: v for k, v in sd._match.groupdict().items() if v is not None and v != ''}
-             log.debug(f"Extracted metadata via groupdict: {metadata}")
-        else:
-             # Fallback: Iterate known properties if match object not exposed (less reliable)
-             log.warning("Could not access match object from StudioData, iterating known properties as fallback.")
-             for prop in _patterns.PROPERTIES:
-                  try:
-                       value = getattr(sd, prop, None) # Use getattr with default
-                       if value is not None and value != '':
-                            metadata[prop] = value
-                  except AttributeError:
-                       pass # Property might not be applicable to this path pattern
-             log.debug(f"Extracted metadata via property iteration: {metadata}")
-
-
-        if not metadata:
-             log.warning(f"No metadata fields were successfully extracted from path: {script_path}")
-        else:
-             log.info(f"Successfully extracted metadata from path: {metadata}")
-        return metadata
-
-    except ValueError as e:
-        # StudioData raises ValueError if no pattern matches
-        log.warning(f"Path '{script_path}' did not match any known studio data patterns: {e}")
-        return {}
-    except ImportError:
-        # Handle case where fixfx.data is present but _patterns is not? Unlikely.
-        log.error("Failed to import fixfx.data components for metadata extraction.")
-        return {}
-    except Exception as e:
-        # Catch any other unexpected errors during StudioData usage
-        log.error(f"Unexpected error extracting metadata from path '{script_path}': {e}")
-        return {}
+    """Wrapper to use fixenv's metadata extraction if available."""
+    return fixenv_get_metadata(script_path) # Uses fallback if fixenv not imported
