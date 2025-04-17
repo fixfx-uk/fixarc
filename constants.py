@@ -9,12 +9,16 @@ try:
         NUKE_EXEC_PATH_WIN as DEFAULT_NUKE_EXECUTABLE_WIN,
         NUKE_EXEC_PATH_LIN as DEFAULT_NUKE_EXECUTABLE_LIN,
         NUKE_EXEC_PATH_MAC as DEFAULT_NUKE_EXECUTABLE_MAC,
+        constants as fixenv_constants
     )
+    # Use studio short name from fixenv if available, otherwise use fallback
+    DEFAULT_VENDOR_NAME = getattr(fixenv_constants, 'STUDIO_SHORT_NAME', 'FixFX')
     _fixenv_available = True
 except ImportError:
     DEFAULT_NUKE_EXECUTABLE_WIN = "C:/Program Files/Nuke15.1v1/Nuke15.1.exe" # Example
     DEFAULT_NUKE_EXECUTABLE_LIN = "/usr/local/Nuke15.1v1/Nuke15.1" # Example
     DEFAULT_NUKE_EXECUTABLE_MAC = "/Applications/Nuke15.1v1/Nuke15.1.app/Contents/MacOS/Nuke15.1" # Example
+    DEFAULT_VENDOR_NAME = "FixFX" # Fallback vendor name
     _fixenv_available = False
 
 
@@ -22,7 +26,6 @@ except ImportError:
 # These should match the spec exactly. Use braces {} for placeholders.
 VENDOR_DIR = "{vendor}"
 SHOW_DIR = "{show}"
-SEASON_DIR = "{season}" # Optional, only added if season metadata exists and is non-empty
 EPISODE_DIR = "{episode}"
 SHOT_DIR = "{shot}"
 
@@ -83,8 +86,11 @@ __all__ = [
     'DEFAULT_NUKE_EXECUTABLE_LIN',
     'DEFAULT_NUKE_EXECUTABLE_MAC',
 
+    # Default Vendor Name
+    'DEFAULT_VENDOR_NAME',
+
     # SPT Folder Names
-    'VENDOR_DIR', 'SHOW_DIR', 'SEASON_DIR', 'EPISODE_DIR', 'SHOT_DIR',
+    'VENDOR_DIR', 'SHOW_DIR', 'EPISODE_DIR', 'SHOT_DIR',
 
     # Relative Paths
     'PROJECT_FILES_REL', 'ELEMENTS_REL', 'PRERENDERS_REL', 'ROTO_REL',

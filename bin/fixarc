@@ -35,7 +35,7 @@ def main():
         # We are passing sys.argv directly, which includes our wrapper path
         # and the user arguments. The module should still parse sys.argv[1:].
 
-        target_module = "fixarc.cli" # Use hyphenated name
+        target_module = "fixarc.cli" # Use fully qualified module name with package prefix
         print(f"[Wrapper] Attempting to run module '{target_module}' with sys.path: {sys.path}", file=sys.stderr)
 
         # Use runpy.run_module to execute the cli module as the main script

@@ -2,7 +2,9 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/fix-archive.iml" filepath="$PROJECT_DIR$/.idea/fix-archive.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/fixarc.iml" filepath="$PROJECT_DIR$/.idea/fixarc.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../fixenv/.idea/fixenv.iml" filepath="$PROJECT_DIR$/../fixenv/.idea/fixenv.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../fixfx/.idea/fixfx.iml" filepath="$PROJECT_DIR$/../fixfx/.idea/fixfx.iml" />
     </modules>
   </component>
 </project>

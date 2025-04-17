@@ -48,18 +48,7 @@ else:
     log.debug("Using fixfx.core.logger.")
 
 
-# --- Version Information ---
-# Attempt to get version from standard location if using setuptools_scm or similar
-try:
-    from ._version import version as __version__
-except ImportError:
-    # Fallback version if _version.py doesn't exist (e.g., not installed)
-    try:
-        # Try reading from a VERSION file perhaps?
-        with open(os.path.join(os.path.dirname(__file__), 'VERSION'), 'r') as vf:
-             __version__ = vf.read().strip()
-    except OSError:
-         __version__ = "0.2.0" # Hardcoded fallback
+__version__ = "0.2.0"
 
 # --- Exports ---
 # Expose the root logger AND the get_logger function for submodules to use
@@ -69,4 +58,4 @@ __all__ = [
     "__version__",
 ]
 
-log.info(f"Fix Archive (fixarc) package initialized (version {__version__})")
+# log.info(f"Fix Archive (fixarc) package initialized (version {__version__})")

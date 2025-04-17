@@ -21,7 +21,7 @@ from . import log
 from . import constants
 from .exceptions import (
     DependencyError, ConfigurationError, ArchiveError, ParsingError, PruningError,
-    RepathingError, GizmoError, NukeExecutionError
+    RepathingError, GizmoError, NukeExecutionError, ArchiverError
 )
 
 # --- Fixenv Integration ---
@@ -30,7 +30,8 @@ try:
     from fixenv import OS, OS_WIN, OS_LIN, OS_MAC
     from fixenv import normalize_path as fixenv_normalize_path
     from fixenv import sanitize_path as fixenv_sanitize_path
-    from fixenv import get_metadata_from_path as fixenv_get_metadata # Use fixenv's metadata parser
+    # Import StudioData for metadata extraction
+    from fixfx.data.studio_data import StudioData
     _fixenv_available = True
     log.debug("Using fixenv for OS detection and path handling.")
 except ImportError:
@@ -48,9 +49,13 @@ except ImportError:
         try: return str(p.resolve(strict=False)) # strict=False for non-existent paths
         except Exception: return str(p.absolute())
 
-    def fixenv_get_metadata(script_path: str) -> Dict[str, Any]:
-         log.warning("Cannot extract metadata from path: 'fixenv'/'fixfx' packages not available.")
-         return {}
+# --- YAML Loading --- (Requires PyYAML)
+try:
+    import yaml
+    _yaml_available = True
+except ImportError:
+    _yaml_available = False
+    log.debug("PyYAML package not found. Cannot load external mapping rules.")
 
 # --- Path Manipulation & Validation ---
 def normalize_path(path: Union[str, Path]) -> str:
@@ -150,7 +155,11 @@ def find_sequence_range_on_disk(path_pattern: Union[str, Path]) -> Optional[Tupl
         for item in base_dir.iterdir():
             if item.is_file():
                 match = frame_regex.match(item.name)
-                if match: try: frames.append(int(match.group(1))) except (ValueError, IndexError): pass
+                if match:
+                    try:
+                        frames.append(int(match.group(1)))
+                    except (ValueError, IndexError):
+                        pass
         if not frames: return None
         return min(frames), max(frames)
     except Exception as e: log.error(f"Error scanning disk for range '{path_pattern}': {e}"); return None
@@ -197,25 +206,25 @@ def execute_nuke_archive_process(
     final_script_archive_path: str,
     metadata: Dict[str, Any],
     bake_gizmos: bool,
-    repath_script_flag: bool,
-    timeout: int = 300 # Increased default timeout for potentially long process
+    timeout: int = 300 # Increased default timeout
 ) -> Dict[str, Any]:
     """
     Executes the _nuke_executor.py script via 'nuke -t'. This performs the
-    entire Nuke-side process: load, prune, dep collection, bake, repath, save.
+    Nuke-side process: load, prune, dep collection, bake, save final script.
+    It does NOT perform repathing or destination path mapping inside Nuke.
 
     Args:
         input_script_path: Absolute path to the original Nuke script.
-        archive_root: Absolute path to the archive destination root.
-        final_script_archive_path: Absolute path where the processed script should be saved.
-        metadata: Dictionary containing vendor, show, episode, shot, etc.
+        archive_root: Absolute path to the archive destination root (passed to Nuke for context).
+        final_script_archive_path: Absolute path where the processed script should be saved by Nuke.
+        metadata: Dictionary containing vendor, show, episode, shot, etc. (passed to Nuke for context).
         bake_gizmos: Boolean flag passed to Nuke script.
-        repath_script_flag: Boolean flag passed to Nuke script.
         timeout: Timeout in seconds for the entire Nuke process.
 
     Returns:
         Dictionary containing the results parsed from the Nuke script's JSON output.
-        Expected keys: 'status', 'final_saved_script_path', 'dependencies_to_copy', 'errors'.
+        Expected keys: 'status', 'final_saved_script_path', 'original_dependencies', 'errors'.
+        'original_dependencies' map contains {node.knob: {evaluated_path, ...}} as found by Nuke.
 
     Raises:
         ConfigurationError: If Nuke executable or executor script not found.
@@ -239,23 +248,19 @@ def execute_nuke_archive_process(
         "-t", # Terminal mode
         str(_NUKE_EXECUTOR_SCRIPT_PATH),
         "--input-script-path", normalize_path(input_script_path),
-        "--archive-root", normalize_path(archive_root),
+        "--archive-root", normalize_path(archive_root), # Pass for context
         "--final-script-archive-path", normalize_path(final_script_archive_path),
-        "--metadata-json", metadata_json_string,
+        "--metadata-json", metadata_json_string, # Pass for context
     ]
     if bake_gizmos: command.append("--bake-gizmos")
-    if repath_script_flag: command.append("--repath-script")
-    # Add other necessary arguments here if _nuke_executor expects them
 
-    log.info(f"Executing Nuke process with {timeout}s timeout...")
+    log.info(f"Executing Nuke process with {timeout}s timeout... (Executor: {_NUKE_EXECUTOR_SCRIPT_PATH.name})")
     log.debug(f"Nuke Command: {' '.join(command)}") # Log full command at debug
     full_stdout = ""
     full_stderr = ""
     start_time = time.time()
 
     try:
-        # Use Popen for potentially better handling of large output / interactivity if needed later
-        # For now, stick with run for simplicity, but increase buffer size if output truncated?
         process = subprocess.run(
             command,
             capture_output=True,
@@ -271,17 +276,14 @@ def execute_nuke_archive_process(
         returncode = process.returncode
 
         log.debug(f"Nuke process finished after {elapsed:.1f}s. Exit Code: {returncode}")
-        # Log stdout/stderr only if they contain data, trim whitespace
         if full_stdout.strip(): log.debug(f"Nuke stdout:\n{full_stdout.strip()}")
         if full_stderr.strip(): log.warning(f"Nuke stderr:\n{full_stderr.strip()}") # Log stderr as warning
 
         # --- Parse JSON Output ---
-        # Expect JSON to be the *last* significant output on stdout
         try:
             results = _parse_nuke_executor_output(full_stdout)
         except ParsingError as pe:
             log.error(f"Failed to parse JSON results from Nuke process: {pe}")
-            # If parsing fails, check exit code and stderr for clues
             if returncode != 0:
                  err_msg = f"Nuke process failed (Exit Code {returncode}) and output parsing error: {pe}."
             else:
@@ -292,13 +294,16 @@ def execute_nuke_archive_process(
         # --- Check Results and Exit Code ---
         if results.get("status") != "success" or returncode != 0:
              error_list = results.get("errors", [])
-             # If Nuke crashed hard, error list might be empty, use stderr
              if not error_list and returncode != 0: error_list.append(f"Nuke process exited with code {returncode}.")
              if full_stderr.strip(): error_list.append(f"Stderr: {full_stderr.strip()[:500]}...")
 
              final_error_message = f"Nuke process reported failure (Status: {results.get('status', 'unknown')}, Exit Code: {returncode}). Errors: {' || '.join(error_list)}"
              log.error(final_error_message)
-             raise NukeExecutionError(final_error_message, results=results) # Include parsed results if available
+             # Include original_dependencies in the exception if available for debugging
+             if "original_dependencies" in results:
+                 raise NukeExecutionError(final_error_message, results=results)
+             else:
+                 raise NukeExecutionError(final_error_message)
 
         # If status is success and exit code is 0
         log.info(f"Nuke processing completed successfully in {elapsed:.1f}s.")
@@ -356,9 +361,108 @@ def _parse_nuke_executor_output(output: str) -> Dict[str, Any]:
              log.debug(f"Problematic String Segment Tried:\n{json_string if json_string else 'N/A'}")
         raise ParsingError(f"Could not retrieve valid JSON results from Nuke executor: {e}") from e
 
+# --- Robust File Operations ---
+def copy_file_or_sequence(source: str, dest: str, frame_range: Optional[Tuple[int, int]] = None, dry_run: bool = False) -> List[Tuple[str, str]]:
+    """
+    Copy a single file or sequence of frame files using shutil.
+    Logs errors but doesn't raise them directly, returns empty list on failure.
+
+    Args:
+        source: Source file path or sequence pattern
+        dest: Destination file path or sequence pattern
+        frame_range: Optional tuple (start, end) for frame range if dealing with sequences
+        dry_run: If True, simulate the operation
+
+    Returns:
+        List of (source, dest) pairs that were successfully planned or copied.
+    """
+    copied_pairs = []
+    norm_source = normalize_path(source)
+    norm_dest = normalize_path(dest)
+
+    try:
+        if is_sequence(norm_source):
+            log.debug(f"Copying sequence: {norm_source} -> {norm_dest}")
+            # Determine frame range if not provided
+            resolved_range = frame_range
+            if not resolved_range:
+                resolved_range = find_sequence_range_on_disk(norm_source)
+                if resolved_range:
+                    log.info(f"Found frame range on disk for {norm_source}: {resolved_range[0]}-{resolved_range[1]}")
+                else:
+                    log.error(f"Sequence pattern detected but no frame range provided or found for: {norm_source}")
+                    return [] # Cannot proceed without a range
+
+            # Expand sequence into individual files
+            source_files = expand_sequence_path(norm_source, resolved_range)
+            dest_files = expand_sequence_path(norm_dest, resolved_range)
+
+            if not source_files:
+                log.error(f"Failed to expand source sequence: {norm_source}")
+                return []
+            if len(source_files) != len(dest_files):
+                log.error(f"Mismatch in frame expansion for {norm_source} ({len(source_files)} frames) -> {norm_dest} ({len(dest_files)} frames)")
+                return []
+
+            dest_dir = Path(norm_dest).parent
+            if not dry_run:
+                try:
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    log.error(f"Failed to create destination directory '{dest_dir}': {e}")
+                    return [] # Cannot copy if destination dir fails
+
+            # Copy each frame file
+            for src, dst in zip(source_files, dest_files):
+                if dry_run:
+                    log.info(f"[DRY RUN] Would copy frame: {src} -> {dst}")
+                    copied_pairs.append((src, dst))
+                else:
+                    src_path_obj = Path(src)
+                    if not src_path_obj.is_file():
+                        # Log as warning, maybe some frames are missing intentionally?
+                        log.warning(f"Source frame missing: {src}")
+                        continue # Skip this frame
+                    try:
+                        shutil.copy2(src, dst)
+                        copied_pairs.append((src, dst))
+                    except Exception as e:
+                        log.error(f"Failed to copy frame {src} -> {dst}: {e}")
+                        # Continue trying other frames
+        else:
+            # Copy single file
+            log.debug(f"Copying single file: {norm_source} -> {norm_dest}")
+            dest_dir = Path(norm_dest).parent
+            if dry_run:
+                log.info(f"[DRY RUN] Would copy: {norm_source} -> {norm_dest}")
+                copied_pairs.append((norm_source, norm_dest))
+            else:
+                try:
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    log.error(f"Failed to create destination directory '{dest_dir}': {e}")
+                    return []
+
+                src_path_obj = Path(norm_source)
+                if not src_path_obj.is_file():
+                    log.error(f"Source file does not exist: {norm_source}")
+                    return []
+                try:
+                    shutil.copy2(norm_source, norm_dest)
+                    copied_pairs.append((norm_source, norm_dest))
+                except Exception as e:
+                    log.error(f"Failed to copy {norm_source} -> {norm_dest}: {e}")
+                    return [] # Fail if single file copy fails
+
+    except Exception as e:
+        log.error(f"Unexpected error in copy_file_or_sequence for {norm_source} -> {norm_dest}: {e}")
+        return [] # Return empty on unexpected error
+
+    return copied_pairs
+
 # --- Robust File Copying ---
 def copy_files_robustly(
-    dependencies_to_copy: Dict[str, Optional[str]], # {source_abs: dest_abs_or_None}
+    dependencies_to_copy: Dict[str, str], # {source_abs: dest_abs}
     dry_run: bool = False
 ) -> Tuple[int, int]:
     """
@@ -367,7 +471,7 @@ def copy_files_robustly(
 
     Args:
         dependencies_to_copy: Dictionary mapping absolute source paths to absolute
-                              destination paths (value is None if destination invalid).
+                              destination paths.
         dry_run: If True, simulate copy operations.
 
     Returns:
@@ -376,134 +480,296 @@ def copy_files_robustly(
     success_count = 0
     failure_count = 0
     total_expected = len(dependencies_to_copy)
-    log.info(f"Starting robust file copy process for {total_expected} dependency entries...")
+    log.info(f"Starting robust file copy process for {total_expected} dependency item(s)...")
     processed_sequences = set() # Track sequence patterns already handled
 
-    for index, (source_path, dest_path) in enumerate(dependencies_to_copy.items()):
+    items = list(dependencies_to_copy.items())
+    items.sort() # Process in a predictable order (helps with sequence handling)
+
+    for index, (source_path, dest_path) in enumerate(items):
 
         log.debug(f"Processing copy item {index+1}/{total_expected}: {source_path} -> {dest_path}")
 
-        if not source_path: # Should not happen if map generated correctly
-            log.warning("Skipping copy item with no source path.")
-            failure_count += 1
-            continue
-        if not dest_path:
-            log.warning(f"Skipping copy for '{source_path}': Invalid or missing destination path.")
+        # Basic validation
+        if not source_path or not dest_path:
+            log.warning(f"Skipping invalid copy item: Source='{source_path}', Dest='{dest_path}'")
             failure_count += 1
             continue
 
         norm_source = normalize_path(source_path)
         norm_dest = normalize_path(dest_path)
 
+        # Check for sequence pattern
         is_seq = is_sequence(norm_source)
-        source_pattern_or_file = norm_source if is_seq else Path(norm_source)
-        dest_dir = Path(norm_dest).parent
-        dest_pattern_or_file = norm_dest
+        sequence_pattern = norm_source if is_seq else None
 
-        # Skip sequences if the pattern was already processed
-        if is_seq and source_pattern_or_file in processed_sequences:
-             log.debug(f"Skipping already processed sequence pattern: {source_pattern_or_file}")
+        # Skip sequences if the pattern was already processed by this loop
+        if is_seq and sequence_pattern in processed_sequences:
+             log.debug(f"Skipping already processed sequence pattern: {sequence_pattern}")
+             # Don't increment success/failure here, it was handled when first encountered
              continue
 
-        # Ensure destination directory exists (create if needed, handle errors)
-        if dry_run:
-             if not dest_dir.exists(): log.info(f"[DRY RUN] Would ensure directory exists: {dest_dir}")
-        else:
-             try:
-                 dest_dir.mkdir(parents=True, exist_ok=True)
-             except OSError as e:
-                 log.error(f"Failed to create destination directory '{dest_dir}' for '{norm_source}': {e}")
-                 failure_count += 1
-                 if is_seq: processed_sequences.add(source_pattern_or_file) # Mark as failed
-                 continue # Skip this item/sequence
+        # Destination directory preparation is handled inside copy_file_or_sequence or external tools
 
         # --- Perform Copy Operation ---
         copy_command = []
         use_shutil_fallback = False
+        copy_success = False
+        num_files_in_op = 1 # Default for single files
 
         try:
             # --- Build Command (Robocopy/Rsync) ---
-            if OS == OS_WIN:
-                 # Robocopy - Basic options: /E (subdirs), /COPY:DAT (data, attrs, times), /R:3 (retries), /W:5 (wait)
-                 # /NJH (no header), /NJS (no summary), /NP (no progress), /NDL (no dir logging) - adjust for desired output
-                 # For sequences, copy individual files. Robocopy better for dirs.
-                 if not is_seq:
-                      # Copy single file: robocopy <SourceDir> <DestDir> <FileName> [options]
-                      src_dir = str(Path(norm_source).parent)
-                      src_file = Path(norm_source).name
-                      command = ['robocopy', src_dir, str(dest_dir), src_file, '/COPY:DAT', '/R:2', '/W:3', '/NJH', '/NJS', '/NP', '/NDL']
-                      # Add /IS to include same files (overwrite)
-                      if Path(norm_dest).exists(): command.append('/IS')
-                      copy_command = command
-                 else:
-                      use_shutil_fallback = True # Robocopy less ideal for frame-by-frame of sequences
-            elif OS == OS_LIN or OS == OS_MAC:
-                 # Rsync - Basic options: -a (archive), -v (verbose), --progress
-                 # Handle sequences carefully. Rsync good for dirs or specific files.
-                 if not is_seq:
-                      # Copy single file: rsync [options] <SourceFile> <DestFile>
-                      command = ['rsync', '-t', '--progress', norm_source, norm_dest] # -t preserves times
-                      copy_command = command
-                 else:
-                      use_shutil_fallback = True # Rsync less ideal for specific frame ranges unless generating file list
+            if OS == OS_WIN and not is_seq:
+                 # Use robocopy for single files (less efficient but robust)
+                 src_dir = str(Path(norm_source).parent)
+                 src_file = Path(norm_source).name
+                 dest_dir = str(Path(norm_dest).parent)
+                 command = ['robocopy', src_dir, dest_dir, src_file, '/COPY:DAT', '/R:2', '/W:3', '/NJH', '/NJS', '/NP', '/NDL']
+                 # Check if destination exists to decide on /IS (include same files/overwrite)
+                 if not dry_run and Path(norm_dest).exists(): command.append('/IS')
+                 copy_command = command
+            elif (OS == OS_LIN or OS == OS_MAC) and not is_seq:
+                 # Use rsync for single files
+                 command = ['rsync', '-t', '-q', norm_source, norm_dest] # -t preserves times, -q quiet
+                 copy_command = command
+            else:
+                 # Use shutil fallback for sequences or non-Win/Lin/Mac OS
+                 log.debug(f"Using shutil fallback for: {norm_source}")
+                 use_shutil_fallback = True
 
             # --- Execute Command or Fallback ---
             if copy_command and not use_shutil_fallback:
                  if dry_run:
                       log.info(f"[DRY RUN] Would execute: {' '.join(copy_command)}")
-                      success_count += 1 # Assume success for dry run simulation
+                      copy_success = True # Assume success for dry run command simulation
                  else:
-                      log.info(f"Executing copy command: {' '.join(copy_command)}")
-                      # Run the command
-                      copy_process = subprocess.run(copy_command, capture_output=True, text=True, check=False)
-                      if copy_process.returncode > 1: # Robocopy uses codes 0-1 for success
+                      log.info(f"Executing copy: {' '.join(copy_command)}")
+                      # Ensure destination directory exists before running command
+                      Path(norm_dest).parent.mkdir(parents=True, exist_ok=True)
+
+                      copy_process = subprocess.run(copy_command, capture_output=True, text=True, check=False, encoding='utf-8', errors='replace')
+                      # Robocopy success codes are <= 1 (or <= 3 if /IS used? Check docs). Rsync is 0.
+                      success_codes = {0, 1} if OS == OS_WIN else {0}
+                      if copy_process.returncode not in success_codes:
                            log.error(f"Copy command failed for '{norm_source}' (Code: {copy_process.returncode}):")
-                           if copy_process.stdout: log.error(f"stdout: {copy_process.stdout.strip()}")
-                           if copy_process.stderr: log.error(f"stderr: {copy_process.stderr.strip()}")
-                           failure_count += 1
+                           stdout = copy_process.stdout.strip()
+                           stderr = copy_process.stderr.strip()
+                           if stdout: log.error(f"stdout: {stdout}")
+                           if stderr: log.error(f"stderr: {stderr}")
+                           copy_success = False
                       else:
                            log.info(f"Successfully copied '{norm_source}' using external tool.")
-                           success_count += 1
+                           copy_success = True
             else:
-                 # Use Shutil Fallback (especially for sequences)
-                 log.debug(f"Using shutil fallback for: {norm_source}")
-                 # Need frame range if sequence
-                 frame_range = None
-                 if is_seq:
-                      # This info isn't passed here easily - need to get it from manifest again?
-                      # Workaround: Scan disk again here if needed. Very inefficient.
-                      # BEST: Nuke process should return range info with dependencies_to_copy map.
-                      # Assuming for now copy_file_or_sequence can handle it (needs refactor there)
-                      log.warning(f"Cannot determine frame range for shutil fallback on sequence: {norm_source}. Copy may fail or be incomplete.")
-                      # Try scanning disk as fallback
-                      frame_range = find_sequence_range_on_disk(norm_source)
-                      if not frame_range:
-                           raise DependencyError(f"Frame range needed for shutil sequence copy of '{norm_source}' but could not be determined.")
-
-
-                 copied_pairs = copy_file_or_sequence(norm_source, norm_dest, frame_range, dry_run)
-                 if not dry_run and not copied_pairs:
-                      # Indicates failure within copy_file_or_sequence
-                      log.error(f"Shutil copy failed for: {norm_source}")
-                      failure_count += 1
+                 # Use Shutil Fallback
+                 # Frame range determination happens inside copy_file_or_sequence now
+                 copied_pairs = copy_file_or_sequence(norm_source, norm_dest, frame_range=None, dry_run=dry_run)
+                 if copied_pairs: # Function returns list of successful copies
+                     copy_success = True
+                     num_files_in_op = len(copied_pairs) if is_seq else 1
                  else:
-                      success_count += len(copied_pairs) if is_seq else 1 # Count frames or single file
+                     # copy_file_or_sequence logs errors internally
+                     log.error(f"Shutil copy failed or resulted in zero files for: {norm_source}")
+                     copy_success = False
+
+            # --- Update Counts ---
+            if copy_success:
+                success_count += num_files_in_op
+            else:
+                # Estimate failure count: assume 1 for single file or guess sequence length?
+                # Better to just count 1 failure per entry that failed.
+                failure_count += 1
 
             # Mark sequence pattern as processed after attempting copy
-            if is_seq:
-                 processed_sequences.add(source_pattern_or_file)
+            if is_seq and sequence_pattern:
+                 processed_sequences.add(sequence_pattern)
 
-        except (DependencyError, ArchiverError, Exception) as e:
+        except (DependencyError, ArchiverError, OSError, Exception) as e:
              log.error(f"Failed to process copy item '{norm_source}' -> '{norm_dest}': {e}")
              failure_count += 1
-             if is_seq: processed_sequences.add(source_pattern_or_file) # Mark as failed
+             if is_seq and sequence_pattern: processed_sequences.add(sequence_pattern) # Mark as failed
 
-    log.info(f"Robust copy process finished. Success: {success_count}, Failures: {failure_count}")
-    # Note: success_count might represent frames for sequences when using shutil
+    # Adjust success count if dry run (we only counted entries, not potential files)
+    if dry_run:
+        # This is tricky without actually expanding sequences. Report based on entries processed.
+        success_count = total_expected - failure_count # Assume all non-failed entries would succeed
+        log.info(f"[DRY RUN] Simulated copy process finished. Potential Success: {success_count}, Failures: {failure_count}")
+    else:
+        log.info(f"Robust copy process finished. Files Copied: {success_count}, Failures: {failure_count}")
+
     return success_count, failure_count
 
 
 # --- Metadata Extraction Wrapper ---
 def get_metadata_from_path(script_path: str) -> Dict[str, Any]:
-    """Wrapper to use fixenv's metadata extraction if available."""
-    return fixenv_get_metadata(script_path) # Uses fallback if fixenv not imported
+    """
+    Extract metadata from a file path using StudioData (if available).
+
+    Args:
+        script_path (str): Path to the script file
+
+    Returns:
+        Dict[str, Any]: Dictionary containing extracted metadata, or empty if unavailable/error.
+    """
+    if not _fixenv_available or StudioData is None:
+        log.warning("Cannot extract metadata from path: 'fixenv'/'fixfx' packages not available.")
+        return {}
+    try:
+        studio_data = StudioData(script_path)
+        # Return the full metadata dictionary
+        return studio_data.metadata if hasattr(studio_data, 'metadata') else {}
+    except Exception as e:
+        log.warning(f"Error extracting metadata from path '{script_path}': {e}")
+        return {}
+
+# --- Path Mapping Logic ---
+
+def load_mapping_rules(config_path: str) -> Optional[List[Dict[str, Any]]]:
+    """Loads mapping rules from a YAML file."""
+    if not _yaml_available:
+        log.error("Cannot load YAML mapping rules: PyYAML package is not installed.")
+        return None
+    try:
+        abs_path = Path(config_path).resolve()
+        if not abs_path.is_file():
+            log.error(f"Mapping config file not found: {abs_path}")
+            return None
+        with open(abs_path, 'r', encoding='utf-8') as f:
+            rules_data = yaml.safe_load(f)
+        if not isinstance(rules_data, dict) or 'mapping_rules' not in rules_data:
+            log.error(f"Invalid YAML format: Missing 'mapping_rules' top-level key in {abs_path}")
+            return None
+        rules_list = rules_data['mapping_rules']
+        if not isinstance(rules_list, list):
+            log.error(f"Invalid YAML format: 'mapping_rules' should be a list in {abs_path}")
+            return None
+        log.info(f"Successfully loaded {len(rules_list)} mapping rules from {abs_path}")
+        return rules_list
+    except yaml.YAMLError as e:
+        log.error(f"Error parsing YAML mapping file {config_path}: {e}")
+        return None
+    except Exception as e:
+        log.error(f"Error reading mapping file {config_path}: {e}")
+        return None
+
+def map_path_using_rules(sd: 'StudioData', rules: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Applies mapping rules based on StudioData properties to find a relative destination category.
+
+    Args:
+        sd: A StudioData object representing the source file path.
+        rules: A list of rule dictionaries loaded from YAML.
+
+    Returns:
+        The matched relative destination path string (e.g., 'assets/images') or None if no rule matches.
+    """
+    if not sd or not hasattr(sd, 'metadata'):
+        log.debug("Cannot map path: Invalid StudioData object provided.")
+        return None
+
+    log.debug(f"Attempting to map path using StudioData: {sd.metadata}")
+    for rule in rules:
+        conditions = rule.get('conditions', {})
+        destination = rule.get('destination')
+        rule_name = rule.get('name', 'Unnamed Rule')
+
+        if not conditions or not destination:
+            log.warning(f"Skipping invalid rule '{rule_name}': Missing 'conditions' or 'destination'.")
+            continue
+
+        match = True
+        # Handle __DEFAULT__ rule first
+        if conditions.get('__DEFAULT__', False):
+            log.debug(f"Matched default rule '{rule_name}'. Destination: '{destination}'")
+            return str(destination)
+
+        # Evaluate other conditions
+        for key, expected_value in conditions.items():
+            actual_value = sd.metadata.get(key)
+
+            if actual_value is None:
+                match = False
+                break # Metadata key not found in StudioData
+
+            # Condition types: exact string or list contains
+            if isinstance(expected_value, list):
+                if str(actual_value) not in expected_value:
+                    match = False
+                    break
+            elif isinstance(expected_value, str):
+                if str(actual_value) != expected_value:
+                    match = False
+                    break
+            else: # Unsupported condition value type
+                log.warning(f"Rule '{rule_name}' condition '{key}': Unsupported value type '{type(expected_value)}'. Skipping condition.")
+                match = False # Treat unsupported condition as non-match
+                break
+
+        if match:
+            log.debug(f"Matched rule '{rule_name}'. Conditions: {conditions}. Destination: '{destination}'")
+            return str(destination) # Return first match
+
+    log.debug(f"No specific rule matched for StudioData: {sd.metadata}")
+    return None # No rule matched
+
+def get_default_archive_path(source_path: str, archive_root: str) -> str:
+    """
+    Constructs the default archive path by replacing the drive letter/UNC prefix
+    and prepending the archive root. Used when no mapping config is provided.
+
+    Example:
+        source_path = "Z:/proj/bob01/shots/BOB_103/.../file.exr"
+        archive_root = "W:/proj/bob01/delivery/archive"
+        Returns: "W:/proj/bob01/delivery/archive/Z_/proj/bob01/shots/BOB_103/.../file.exr"
+
+        source_path = "//server/share/proj/bob01/.../file.exr"
+        archive_root = "W:/proj/bob01/delivery/archive"
+        Returns: "W:/proj/bob01/delivery/archive/server/share/proj/bob01/.../file.exr"
+
+    Args:
+        source_path: The absolute source path (normalized with forward slashes).
+        archive_root: The absolute archive root path (normalized).
+
+    Returns:
+        The calculated absolute destination path.
+
+    Raises:
+        ValueError: If paths are invalid or cannot be processed.
+    """
+    norm_source = normalize_path(source_path)
+    norm_root = normalize_path(archive_root)
+
+    if not Path(norm_root).is_absolute():
+        raise ValueError(f"Archive root must be an absolute path: {archive_root}")
+
+    relative_part = ""
+    # Handle Windows drive letters (e.g., C:/...) or UNC paths (e.g., //server/share/...)
+    drive_match = re.match(r"^([a-zA-Z]):/(.*)", norm_source)
+    unc_match = re.match(r"^//([^/]+/[^/]+)/(.*)", norm_source) # Match //server/share
+
+    if drive_match:
+        drive = drive_match.group(1)
+        path_remainder = drive_match.group(2)
+        relative_part = f"{drive}_/{path_remainder}" # e.g., C_/my/path
+    elif unc_match:
+        server_share = unc_match.group(1)
+        path_remainder = unc_match.group(2)
+        relative_part = f"{server_share}/{path_remainder}" # e.g., server/share/my/path
+    elif norm_source.startswith('/'): # Linux/Mac absolute paths
+        # Prepend a marker or just use the path relative to root? Let's use root_
+        relative_part = f"root_{norm_source.lstrip('/')}"
+    else:
+        # Assume it might be a relative path already? Or just use it as is?
+        # Using it as-is might be dangerous. Let's raise an error for unexpected formats.
+        raise ValueError(f"Cannot determine relative part for default mapping from source: {source_path}")
+
+    # Ensure the relative part doesn't try to escape the root (e.g., contain "..")
+    # Splitting by / is safe due to normalize_path
+    if '..' in relative_part.split('/'):
+        raise ValueError(f"Source path resulted in potentially unsafe relative path: {relative_part}")
+
+    # Combine archive root and the modified relative part
+    # Use os.path.join and then normalize again to handle separators correctly
+    final_path = normalize_path(os.path.join(norm_root, relative_part))
+    log.debug(f"Default mapping: '{source_path}' -> '{final_path}'")
+    return final_path
