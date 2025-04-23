@@ -106,43 +106,32 @@ def get_archive_script_path(
 ) -> str:
     """
     Determines the final path for the Nuke script within the archive.
-    Uses a standard relative path defined in constants (PROJECT_FILES_REL).
+    Uses a standard relative path defined in constants (PROJECT_FILES_REL)
+    and preserves the original filename.
 
     Args:
         archive_root: The absolute root path of the archive destination.
-        metadata: Dictionary containing SPT metadata (must include 'shot').
-        original_script_name: The filename of the original script being processed.
+        metadata: Dictionary containing metadata.
+        original_script_name: The filename of the original script, used as-is.
 
     Returns:
         The absolute destination path for the script as a string.
 
     Raises:
         ConfigurationError: If required metadata is missing or invalid.
-        ArchiverError: If path construction fails or final name is invalid.
+        ArchiverError: If path construction fails or the filename is invalid.
     """
     log.debug(f"Determining archive path for script '{original_script_name}'")
     try:
-        # Ensure 'shot' metadata is present
-        shot_name = metadata.get('shot')
-        if not shot_name: raise KeyError("'shot' metadata key is required.")
-
-        # Use shot name + _archive suffix + original extension (.nk)
-        base_name, ext = os.path.splitext(original_script_name)
-        if not ext or ext.lower() != ".nk": ext = ".nk" # Ensure .nk extension
-
-        # Sanitize shot name for use in filename
-        safe_shot_name = str(shot_name).replace('/', '_').replace('\\', '_').replace(':', '_').strip()
-        if not ensure_ltfs_safe(safe_shot_name):
-             raise ValueError(f"Shot metadata '{shot_name}' resulted in unsafe filename component '{safe_shot_name}'.")
-
-        archive_script_name = f"{safe_shot_name}_archive{ext}"
-        # Final check on the generated filename
-        if not ensure_ltfs_safe(archive_script_name):
-             raise ValueError(f"Generated archive script name '{archive_script_name}' contains invalid characters.")
-
+        # Validate the original filename is LTFS safe
+        if not ensure_ltfs_safe(original_script_name):
+             log.warning(f"Original script name '{original_script_name}' contains potentially unsafe characters.")
+        
         # Get the target directory within SPT structure using the fixed relative path for project files
         archive_script_dir = _get_spt_directory(archive_root, metadata, constants.PROJECT_FILES_REL)
-        final_path = archive_script_dir / archive_script_name
+        
+        # Simply use the original script name without modification
+        final_path = archive_script_dir / original_script_name
 
         log.info(f"Determined final archive script path: {final_path}")
         return str(final_path)

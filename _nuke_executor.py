@@ -25,6 +25,37 @@ import argparse
 from pathlib import Path # Use pathlib for path manipulation within Nuke
 from typing import Dict, List, Set, Optional, Tuple, Any # Use standard typing
 import tempfile
+import logging
+
+# Set up logging to stderr for the wrapper to capture
+logging.basicConfig(level=logging.DEBUG,
+                    format='%(asctime)s [%(levelname)s] %(message)s',
+                    stream=sys.stderr)
+log = logging.getLogger(__name__)
+
+def log_nuke_path_on_load():
+    """Logs the NUKE_PATH environment variable as seen by Nuke."""
+    nuke_path = os.environ.get('NUKE_PATH', 'Not Set')
+    log.debug(f"NUKE_PATH inside Nuke (onScriptLoad): {nuke_path}")
+    
+    # Also check for other plugins in the path
+    log.debug(f"Nuke plugin path: {nuke.pluginPath()}")
+    
+    # Check if OCIOColorSpace exists
+    try:
+        colorspaces = []
+        if 'OCIO_ACTIVE_CONFIG' in os.environ:
+            log.debug(f"OCIO_ACTIVE_CONFIG: {os.environ['OCIO_ACTIVE_CONFIG']}")
+        if nuke.env.get('ocioConfigPath'):
+            log.debug(f"nuke.env['ocioConfigPath']: {nuke.env.get('ocioConfigPath')}")
+        ocio_plugin = nuke.plugins(nuke.ALL | nuke.NODIR)
+        plugin_list = ", ".join(ocio_plugin)
+        log.debug(f"Nuke plugins: {plugin_list[:200]}...")
+    except Exception as e:
+        log.debug(f"Error checking OCIO: {e}")
+
+# Register the callback to run before the script loads
+nuke.addOnScriptLoad(log_nuke_path_on_load)
 
 # --- Simple Placeholder Exceptions (Internal) ---
 class PruningError(Exception): pass

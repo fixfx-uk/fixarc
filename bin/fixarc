@@ -10,6 +10,8 @@ import sys
 import os
 import runpy
 import platform
+import subprocess
+from pathlib import Path
 
 def main():
     """Modify sys.path and use runpy to run the fixarc CLI module."""
@@ -18,82 +20,127 @@ def main():
         script_dir = os.path.dirname(os.path.abspath(__file__))
         # Get the project root directory (one level up)
         project_root = os.path.dirname(script_dir)
-
-        # Check if the project root is already in sys.path
+        
+        # We need to set up paths first to import fixfx.log
         if project_root not in sys.path:
-            # Add the project root to the beginning of sys.path
             sys.path.insert(0, project_root)
-            print(f"[Wrapper] Added to sys.path: {project_root}", file=sys.stderr)
-        else:
-            print(f"[Wrapper] Project root already in sys.path: {project_root}", file=sys.stderr)
-
-        # --- Set up NUKE_PATH environment variable before running the CLI ---
-        print(f"[Wrapper] Original NUKE_PATH: {os.environ.get('NUKE_PATH', 'Not Set')}", file=sys.stderr)
-        
-        # Helper function to normalize paths
-        def normalize_path(path):
-            return str(path).replace("\\", "/")
-        
-        # Try to find additional plugin paths that might be needed
-        plugin_paths = []
-        
-        # Check if DasGrain path exists and add it
-        dasgrain_paths = [
-            "Z:/pipe/plugins/nuke/DasGrain",
-            "//192.168.14.252/FixStore/pipe/plugins/nuke/DasGrain"
-        ]
-        for path in dasgrain_paths:
-            if os.path.exists(path):
-                plugin_paths.append(normalize_path(path))
-                print(f"[Wrapper] Added DasGrain plugin path: {path}", file=sys.stderr)
-        
-        # Try importing fixenv for more paths
+            
+        # Try to get fixenv path
+        fixenv_root = os.path.abspath(os.path.join(project_root, '..', 'fixenv'))
+        if os.path.exists(fixenv_root) and fixenv_root not in sys.path:
+            sys.path.insert(0, fixenv_root)
+            
+        # Import fixfx.log for logging
         try:
-            # First add fixenv to path if needed
-            if os.path.exists(os.path.join(project_root, '..', 'fixenv')):
-                fixenv_path = os.path.abspath(os.path.join(project_root, '..', 'fixenv'))
-                if fixenv_path not in sys.path:
-                    sys.path.insert(0, fixenv_path)
-                    print(f"[Wrapper] Added fixenv to sys.path: {fixenv_path}", file=sys.stderr)
-            
-            # Now try to import
-            from fixenv import NUKE_MAIN_PATH
-            nuke_main_path = str(NUKE_MAIN_PATH)
-            print(f"[Wrapper] Found fixenv.NUKE_MAIN_PATH: {nuke_main_path}", file=sys.stderr)
-            plugin_paths.append(nuke_main_path)
-            
-            # Also try to get other plugin paths from fixenv
-            try:
-                from fixenv import NUKE_PLUGIN_PATH
-                if NUKE_PLUGIN_PATH:
-                    plugin_paths.append(str(NUKE_PLUGIN_PATH))
-                    print(f"[Wrapper] Found fixenv.NUKE_PLUGIN_PATH: {NUKE_PLUGIN_PATH}", file=sys.stderr)
-            except ImportError:
-                print("[Wrapper] NUKE_PLUGIN_PATH not available in fixenv", file=sys.stderr)
+            from fixfx import log
         except ImportError:
-            print("[Wrapper] Could not import NUKE_MAIN_PATH from fixenv", file=sys.stderr)
-        
-        # Get existing NUKE_PATH or initialize empty
-        nuke_path = os.environ.get('NUKE_PATH', '')
-        
-        # Determine path separator based on OS
-        path_sep = ';' if platform.system() == 'Windows' else ':'
-        
-        # Combine all paths
-        if plugin_paths:
-            joined_plugin_paths = path_sep.join(plugin_paths)
-            if nuke_path:
-                nuke_path = f"{joined_plugin_paths}{path_sep}{nuke_path}"
-            else:
-                nuke_path = joined_plugin_paths
-                
-        os.environ['NUKE_PATH'] = nuke_path
-        print(f"[Wrapper] Set NUKE_PATH: {nuke_path}", file=sys.stderr)
-        
-        # --- End of NUKE_PATH setup ---
+            # Fall back to stderr if fixfx.log can't be imported
+            import logging
+            logging.basicConfig(level=logging.DEBUG)
+            log = logging.getLogger("fixarc.wrapper")
+            log.warning("Could not import fixfx.log, using basic logging")
+            
+        # Now that we have log, we can log the paths we added
+        log.info(f"Using project root: {project_root}")
+        log.info(f"Using fixenv root: {fixenv_root}")
 
+        # --- Bootstrap fixenv environment ---
+        try:
+            # Check for config file existence before running fixe
+            config_path = os.path.join(os.environ.get('FIXSTORE_DRIVE', 'Z:'), 'pipe', '.config', 'env', 'studio_config.json')
+            log.info(f"Looking for studio config at: {config_path}")
+            if os.path.exists(config_path):
+                log.info(f"Found studio_config.json, checking content...")
+                try:
+                    import json
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                    if 'NUKE_PATH' in config:
+                        log.info(f"NUKE_PATH in config: {config['NUKE_PATH']}")
+                    else:
+                        log.warning("NUKE_PATH not found in studio_config.json")
+                except Exception as e:
+                    log.warning(f"Error reading studio_config.json: {e}")
+            else:
+                log.warning(f"studio_config.json not found at {config_path}")
+                
+            # Run fixe to set up environment
+            fixe_path = os.path.join(fixenv_root, 'bin', 'fixe')
+            if os.path.exists(fixe_path):
+                log.info(f"Running fixe for environment setup...")
+                
+                # Handle different OS environments
+                if platform.system() == 'Windows':
+                    # On Windows, we might need a shell to eval the exports or run Python directly
+                    try:
+                        import fixenv
+                        log.info(f"Imported fixenv directly")
+                        
+                        # Check fixenv attributes
+                        log.debug(f"fixenv.__file__: {fixenv.__file__}")
+                        
+                        # Try to access core functionality
+                        try:
+                            # Test if we can access the core functions directly
+                            log.info("Testing fixenv.core.update_studio_environment()")
+                            fixenv.core.update_studio_environment()
+                            log.info("update_studio_environment() completed")
+                            
+                            # Verify if studio_config.json was loaded properly
+                            try:
+                                log.info("Testing fixenv.core.load()")
+                                config = fixenv.core.load()
+                                if config:
+                                    log.info(f"Config loaded successfully: {list(config.keys())}")
+                                    if 'NUKE_PATH' in config:
+                                        log.info(f"NUKE_PATH in config: {config['NUKE_PATH']}")
+                                    else:
+                                        log.warning("NUKE_PATH not found in loaded config")
+                                else:
+                                    log.warning("Empty config loaded")
+                            except Exception as e:
+                                log.error(f"Error testing fixenv.core.load(): {e}")
+                                
+                        except Exception as e:
+                            log.error(f"Error testing core functions: {e}")
+                    except ImportError:
+                        log.warning(f"Could not import fixenv. Environment might not be fully set up.")
+                else:
+                    # On Unix-like systems, run fixe directly
+                    try:
+                        subprocess.run([fixe_path], shell=True, check=True)
+                        log.info(f"Successfully ran fixe")
+                    except subprocess.SubprocessError as e:
+                        log.warning(f"fixe script failed: {e}")
+            else:
+                log.warning(f"fixe script not found at {fixe_path}")
+        except Exception as e:
+            log.warning(f"Environment setup incomplete: {e}")
+
+        # Log the current NUKE_PATH for debugging
+        nuke_path = os.environ.get('NUKE_PATH', 'Not Set')
+        log.info(f"Current NUKE_PATH: {nuke_path}")
+        
+        # Troubleshoot if NUKE_PATH is not set
+        if nuke_path == 'Not Set':
+            log.warning("NUKE_PATH environment variable is not set!")
+            
+            # Check common environment variables
+            for var in ['PATH', 'PYTHONPATH', 'NUKE_PATH', 'FIXSTORE_DRIVE']:
+                log.debug(f"Environment variable {var}: {os.environ.get(var, 'Not Set')}")
+                
+            # Try manual environment variable update
+            try:
+                log.info("Attempting manual NUKE_PATH setup...")
+                from fixenv.constants import NUKE_MAIN_PATH
+                os.environ['NUKE_PATH'] = str(NUKE_MAIN_PATH)
+                log.info(f"Manually set NUKE_PATH to {os.environ.get('NUKE_PATH')}")
+            except Exception as e:
+                log.error(f"Manual NUKE_PATH setup failed: {e}")
+        
         target_module = "fixarc.cli" # Use fully qualified module name with package prefix
-        print(f"[Wrapper] Attempting to run module '{target_module}' with sys.path: {sys.path}", file=sys.stderr)
+        log.info(f"Attempting to run module '{target_module}'")
+        log.debug(f"sys.path: {sys.path}")
 
         # Use runpy.run_module to execute the cli module as the main script
         # This is closer to how 'python -m' works internally.
@@ -104,14 +151,14 @@ def main():
         return 0
 
     except ModuleNotFoundError as mnfe:
-        print(f"[Wrapper] Error: runpy could not find module '{target_module}'.", file=sys.stderr)
-        print(f"[Wrapper] Details: {mnfe}", file=sys.stderr)
-        print(f"[Wrapper] Final sys.path: {sys.path}", file=sys.stderr)
+        log.error(f"Error: runpy could not find module '{target_module}'.")
+        log.error(f"Details: {mnfe}")
+        log.debug(f"Final sys.path: {sys.path}")
         # Check if the directory exists but is missing __init__.py?
         mod_path_parts = target_module.split('.')
         potential_pkg_dir = os.path.join(project_root, mod_path_parts[0])
         if os.path.isdir(potential_pkg_dir) and not os.path.exists(os.path.join(potential_pkg_dir, "__init__.py")):
-             print(f"[Wrapper] Hint: Directory '{potential_pkg_dir}' exists but is missing an '__init__.py' file.", file=sys.stderr)
+             log.error(f"Hint: Directory '{potential_pkg_dir}' exists but is missing an '__init__.py' file.")
         return 1
     except Exception as e:
         # Catch errors during runpy execution or other wrapper errors
@@ -120,7 +167,7 @@ def main():
             # If the module called sys.exit(), propagate the exit code
             return e.code
         else:
-            print(f"Error running fixarc wrapper or executing module: {e}", file=sys.stderr)
+            log.error(f"Error running fixarc wrapper or executing module: {e}")
             return 1
 
 if __name__ == "__main__":

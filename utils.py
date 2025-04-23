@@ -18,9 +18,7 @@ import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Union, Set, Callable
 
-# Use logger from __init__
 from fixarc import log
-# Import constants and exceptions relative to the package
 from fixarc import constants
 from fixarc.exceptions import (
     DependencyError, ConfigurationError, ArchiveError, ParsingError, PruningError,
@@ -175,8 +173,8 @@ def get_nuke_executable() -> str:
     Raises:
         ConfigurationError: If Nuke executable is not found at the default location
     """
-    # Use the default executable from fixenv based on OS
-    default_path = fixenv.NUKE_EXEC_PATH_DEFAULT
+    # Use the default path from fixenv constants if available
+    default_path = fixenv.constants.NUKE_EXEC_PATH_DEFAULT
 
     if Path(default_path).is_file():
         log.debug(f"Using default Nuke executable for {fixenv.OS}: {default_path}")
@@ -247,7 +245,8 @@ def execute_nuke_archive_process(
 
     # Use environment as is - NUKE_PATH is set up in the fixarc launcher script
     env = os.environ.copy()
-
+    log.debug(f"Nuke Environment: {env}")
+    
     log.info(f"Executing Nuke process with {timeout}s timeout... (Executor: {constants.NUKE_EXECUTOR_SCRIPT_PATH.name})")
     log.debug(f"Nuke Command: {' '.join(command)}") # Log full command at debug
     full_stdout = ""

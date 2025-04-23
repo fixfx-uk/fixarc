@@ -110,7 +110,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-v", "--verbose",
         action="count",
-        default=0,
+        default=2,
         help="Increase logging verbosity (-v for INFO, -vv for DEBUG)."
     )
     parser.add_argument(
@@ -133,15 +133,37 @@ def _setup_logging(verbosity: int) -> None:
     try:
         # Set level on the root logger obtained from __init__
         log.setLevel(level)
-        # Ensure handlers also respect the level
-        for handler in log.handlers:
-            handler.setLevel(level)
+        
+        # Check if the logger has any handlers; if not, add a console handler
+        if not log.handlers:
+            # Create a console handler
+            console_handler = logging.StreamHandler(sys.stderr)
+            console_handler.setLevel(level)
+            # Create a formatter
+            formatter = logging.Formatter('%(asctime)s [%(levelname)-7s] [%(name)s]: %(message)s')
+            console_handler.setFormatter(formatter)
+            # Add the handler to the logger
+            log.addHandler(console_handler)
+            log.debug("Added console handler to logger")
+        else:
+            # Ensure handlers also respect the level
+            for handler in log.handlers:
+                handler.setLevel(level)
+                
+        # Ensure propagation to root logger is enabled
+        log.propagate = True
+        
+        # Test log output
+        log.debug("Debug logging enabled")
         log.info(f"Logging level set to {logging.getLevelName(level)}")
     except Exception as e:
         # Fallback to standard logging if our logger object is problematic
         logging.basicConfig(level=level, format='%(asctime)s [%(levelname)-7s] [%(name)s]: %(message)s')
         logging.warning(f"Could not configure package logger, using basicConfig. Error: {e}")
         log.warning(f"Logging level set to {logging.getLevelName(level)} (basic config)")
+        
+    # Always output something to stderr to verify logging is working
+    sys.stderr.write(f"Logging initialized at level: {logging.getLevelName(level)}\n")
 
 def _prepare_and_validate_metadata(args: argparse.Namespace, script_path: str) -> Dict[str, Any]:
     """Infers, merges, and validates required metadata."""
@@ -297,6 +319,10 @@ def main(args: Optional[List[str]] = None) -> None:
 
         # --- Copy Dependencies ---
         log.info("--- Step 2: Copying Dependencies ---")
+        # Add log verification output
+        sys.stderr.write("Direct stderr write: Starting dependency copy step\n")
+        sys.stdout.write("Direct stdout write: Starting dependency copy step\n")
+        
         dependencies_to_copy = nuke_results.get("dependencies_to_copy", {})
         if not dependencies_to_copy:
              log.warning("Nuke process returned no dependencies to copy.")

@@ -14,6 +14,14 @@ from fixfx.core.logger import get_logger
 # Initialize the package root logger
 log = get_logger(__name__)  # Logger named 'fixarc'
 
+# Ensure we have a console handler
+if not any(isinstance(h, logging.StreamHandler) for h in log.handlers):
+    console_handler = logging.StreamHandler(sys.stderr)
+    formatter = logging.Formatter('%(asctime)s [%(levelname)-7s] [%(name)s]: %(message)s')
+    console_handler.setFormatter(formatter)
+    log.addHandler(console_handler)
+    log.debug("Added console handler to fixarc logger during initialization")
+
 __version__ = "0.2.0"
 
 # --- Exports ---
