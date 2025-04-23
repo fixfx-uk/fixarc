@@ -21,6 +21,7 @@ import time
 from typing import Dict, Any, Optional, List
 # Use package-level logger and __version__
 from . import log, __version__
+from . import constants  # Import constants module to access DEFAULT_VENDOR_NAME
 from .archive_utils import get_archive_script_path # Specific utility for script path
 from .utils import (
     get_metadata_from_path, normalize_path, parse_frame_range,
@@ -58,16 +59,13 @@ def create_parser() -> argparse.ArgumentParser:
     # --- Metadata Group (Overrides inferred values) ---
     metadata_group = parser.add_argument_group('SPT Metadata (Overrides inferred values)')
     metadata_group.add_argument(
-        "--vendor", type=str, required=True, # Vendor is almost always needed explicitly
-        help="Vendor name (e.g., 'FixFX'). REQUIRED."
+        "--vendor", type=str, 
+        default=constants.DEFAULT_VENDOR_NAME,
+        help=f"Vendor name (e.g., 'FixFX'). Defaults to {constants.DEFAULT_VENDOR_NAME} from your fixenv config if available."
     )
     metadata_group.add_argument(
         "--show", type=str,
         help="Show name (e.g., 'bob01'). Will attempt to infer from path if not provided."
-    )
-    metadata_group.add_argument(
-        "--season", type=str,
-        help="Optional Season identifier (e.g., 's01', '1'). Affects directory structure if provided."
     )
     metadata_group.add_argument(
         "--episode", type=str,
@@ -149,33 +147,63 @@ def _prepare_and_validate_metadata(args: argparse.Namespace, script_path: str) -
     """Infers, merges, and validates required metadata."""
     log.debug("Preparing and validating metadata...")
     inferred = get_metadata_from_path(script_path) # Uses fixenv if available
+    
+    # Log what was inferred from the path
+    if inferred:
+        log.debug(f"Metadata inferred from path: {inferred}")
+    else:
+        log.warning("No metadata could be inferred from the script path.")
+
+    # Try to get a complete shot identifier directly from inferred data first
+    inferred_shot = inferred.get("shot_name") or inferred.get("shot")
+    
+    # If shot wasn't directly available, check if we have the components to build it
+    if not inferred_shot and all(k in inferred for k in ("episode", "sequence", "shot_number")):
+        ep = inferred.get("episode")
+        sq = inferred.get("sequence")
+        sh_num = inferred.get("shot_number") or inferred.get("shot") # Could be named differently
+        sh_tag = inferred.get("tag", "")
+        if ep and sq and sh_num:
+            inferred_shot = f"{ep}_{sq}_{sh_num}"
+            if sh_tag: inferred_shot += f"_{sh_tag}"
+            log.info(f"Constructed shot name from inferred parts: {inferred_shot}")
 
     # Merge CLI args over inferred data
     metadata = {
-        "vendor": args.vendor, # Required CLI arg
-        "show": args.show or inferred.get("project"), # Map inferred 'project' to 'show'
-        "season": args.season or inferred.get("season", ""), # Optional
+        "vendor": args.vendor or constants.DEFAULT_VENDOR_NAME,
+        "show": args.show or inferred.get("project") or inferred.get("show"), # Map inferred 'project' to 'show'
         "episode": args.episode or inferred.get("episode"),
-        "shot": args.shot or inferred.get("shot"),
+        "shot": args.shot or inferred_shot,
     }
-
-    # Attempt to construct shot name if missing parts inferred
-    if not metadata["shot"] and all(k in inferred for k in ("episode", "sequence", "shot")):
-         ep = inferred.get("episode")
-         sq = inferred.get("sequence")
-         sh_num = inferred.get("shot") # Assumes 'shot' holds number if pattern matched
-         sh_tag = inferred.get("tag", "")
-         if ep and sq and sh_num:
-               constructed = f"{ep}_{sq}_{sh_num}"
-               if sh_tag: constructed += f"_{sh_tag}"
-               log.info(f"Constructed shot name from inferred parts: {constructed}")
-               metadata["shot"] = constructed
+    
+    # Log what we got from CLI vs inference
+    for key, value in metadata.items():
+        cli_value = getattr(args, key, None)
+        if cli_value:
+            log.debug(f"Using CLI-provided value for '{key}': {cli_value}")
+        elif value:
+            log.debug(f"Using inferred value for '{key}': {value}")
 
     # Validate required fields for SPT structure
     required_keys = ["vendor", "show", "episode", "shot"] # Episode needed for structure
     missing = [k for k in required_keys if not metadata.get(k)]
+    
     if missing:
-        raise ConfigurationError(f"Missing required metadata for archive structure. Please provide via CLI (--{', --'.join(missing)}) or ensure path is parseable. Required: {required_keys}. Found: {metadata}")
+        # For more helpful error message, indicate which values couldn't be inferred
+        missing_args = [f"--{k}" for k in missing]
+        
+        # Compose a helpful error message with examples
+        error_msg = f"Missing required metadata for archive structure. Please provide via CLI ({', '.join(missing_args)})."
+        
+        # Add path inference suggestion
+        error_msg += "\n\nAlternatively, ensure your script path follows the studio pattern for automatic inference."
+        error_msg += "\nExample path: /proj/bob01/shots/BOB_100/BOB_100_010_CMP/publish/nuke/my_script.nk"
+        
+        # Add what we found (or didn't find)
+        error_msg += f"\n\nRequired: {required_keys}"
+        error_msg += f"\nFound: {metadata}"
+        
+        raise ConfigurationError(error_msg)
 
     log.info(f"Using metadata: {metadata}")
     return metadata
@@ -195,6 +223,12 @@ def main(args: Optional[List[str]] = None) -> None:
     _setup_logging(parsed_args.verbose)
     log.info(f"--- Starting Fix Archive Tool v{__version__} ---")
     if parsed_args.dry_run: log.warning("--- DRY RUN MODE ENABLED ---")
+    
+    # Log the vendor source
+    if parsed_args.vendor == constants.DEFAULT_VENDOR_NAME:
+        log.debug(f"Using default vendor '{constants.DEFAULT_VENDOR_NAME}' from configuration")
+    else:
+        log.debug(f"Using vendor '{parsed_args.vendor}' specified via --vendor argument")
 
     original_script_path: Optional[str] = None
     final_script_archive_path: Optional[str] = None
@@ -212,8 +246,22 @@ def main(args: Optional[List[str]] = None) -> None:
              log.warning(f"Archive root directory does not exist: {archive_root}. It will be created.")
         elif not Path(archive_root).is_dir():
              raise ConfigurationError(f"Archive root path exists but is not a directory: {archive_root}")
+             
+        # --- Input Path Format Log ---
+        script_filename = Path(original_script_path).name
+        script_dir = str(Path(original_script_path).parent)
+        log.info(f"Input script: {script_filename}")
+        log.debug(f"Script directory: {script_dir}")
 
-        metadata = _prepare_and_validate_metadata(parsed_args, original_script_path)
+        # Prepare metadata (infer from path or use CLI args)
+        try:
+            metadata = _prepare_and_validate_metadata(parsed_args, original_script_path)
+        except ConfigurationError as e:
+            # Add helpful hint about using verbose flag for more info
+            if parsed_args.verbose < 2:  # If not already in debug mode
+                raise ConfigurationError(f"{str(e)}\n\nHint: Run with -vv for detailed debug logging") from None
+            else:
+                raise
 
         # Determine the final path for the Nuke script *before* calling Nuke process
         final_script_archive_path = get_archive_script_path(
@@ -239,7 +287,7 @@ def main(args: Optional[List[str]] = None) -> None:
             nuke_results = execute_nuke_archive_process(
                 input_script_path=original_script_path,
                 archive_root=archive_root,
-                final_script_archive_pathn=final_script_archive_path,
+                final_script_archive_path=final_script_archive_path,
                 metadata=metadata,
                 bake_gizmos=parsed_args.bake_gizmos,
                 repath_script_flag=parsed_args.update_script,

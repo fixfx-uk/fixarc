@@ -1,70 +1,64 @@
 # fixarc/utils.py
 """Utility functions for the Fix Archive (fixarc) tool."""
 
+import json
+import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
-import json
-import tempfile
-import platform
 import sys
 import time
+import traceback
+import tempfile
+import platform
 import select
 import datetime
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any, Union
+from typing import List, Tuple, Optional, Dict, Any, Union, Set, Callable
 
 # Use logger from __init__
-from . import log
+from fixarc import log
 # Import constants and exceptions relative to the package
-from . import constants
-from .exceptions import (
+from fixarc import constants
+from fixarc.exceptions import (
     DependencyError, ConfigurationError, ArchiveError, ParsingError, PruningError,
     RepathingError, GizmoError, NukeExecutionError, ArchiverError
 )
 
 # --- Fixenv Integration ---
-# Assume fixenv might be available, provide fallbacks if not
-try:
-    from fixenv import OS, OS_WIN, OS_LIN, OS_MAC
-    from fixenv import normalize_path as fixenv_normalize_path
-    from fixenv import sanitize_path as fixenv_sanitize_path
-    # Import StudioData for metadata extraction
-    from fixfx.data.studio_data import StudioData
-    _fixenv_available = True
-    log.debug("Using fixenv for OS detection and path handling.")
-except ImportError:
-    log.warning("fixenv package not found. Using basic OS detection and path normalization.")
-    _fixenv_available = False
-    OS = platform.system()
-    OS_WIN, OS_LIN, OS_MAC = "Windows", "Linux", "Darwin"
+# fixenv is a hard dependency
+import fixenv
+from fixfx.data.studio_data import StudioData
+log.debug("Using fixenv for path handling and OS detection.")
 
-    # Basic fallbacks
-    def fixenv_normalize_path(path: Union[str, Path]) -> str:
-        return str(path).replace("\\", "/")
-
-    def fixenv_sanitize_path(path: Union[str, Path]) -> str:
-        p = Path(fixenv_normalize_path(path))
-        try: return str(p.resolve(strict=False)) # strict=False for non-existent paths
-        except Exception: return str(p.absolute())
-
-# --- YAML Loading --- (Requires PyYAML)
-try:
-    import yaml
-    _yaml_available = True
-except ImportError:
-    _yaml_available = False
-    log.debug("PyYAML package not found. Cannot load external mapping rules.")
+# --- YAML Loading --- (Required dependency)
+import yaml
+log.debug("Using PyYAML for configuration files.")
 
 # --- Path Manipulation & Validation ---
 def normalize_path(path: Union[str, Path]) -> str:
-    """Normalize path using fixenv's function or basic fallback."""
-    return fixenv_normalize_path(path)
+    """Normalize path using fixenv's function.
+    
+    Args:
+        path: Path to normalize
+        
+    Returns:
+        Normalized path with forward slashes
+    """
+    return fixenv.normalize_path(path)
 
 def sanitize_path(path: Union[str, Path]) -> str:
-    """Sanitize path using fixenv's function or basic fallback."""
-    return fixenv_sanitize_path(path)
+    """Sanitize path using fixenv's function.
+    
+    Args:
+        path: Path to sanitize
+        
+    Returns:
+        Sanitized absolute path
+    """
+    return fixenv.sanitize_path(path)
 
 def validate_path_exists(path: str, context: str = "Dependency") -> None:
     """Checks if a file or sequence directory exists. Raises DependencyError if not."""
@@ -173,32 +167,26 @@ def parse_frame_range(range_str: Optional[str]) -> Optional[Tuple[int, int]]:
 
 # --- Nuke Interaction ---
 def get_nuke_executable() -> str:
-    """Finds the Nuke executable path."""
-    # Prioritize NUKE_EXE_PATH env var
-    nuke_path_env = os.getenv("NUKE_EXE_PATH")
-    if nuke_path_env:
-        nuke_path_env_obj = Path(nuke_path_env)
-        if nuke_path_env_obj.is_file():
-            log.debug(f"Using Nuke executable from NUKE_EXE_PATH: {nuke_path_env}")
-            return normalize_path(nuke_path_env)
-        else:
-            log.warning(f"NUKE_EXE_PATH ('{nuke_path_env}') does not point to a valid file. Checking defaults...")
-
-    # Fallback to defaults based on OS
-    if OS == OS_WIN: default_path = constants.DEFAULT_NUKE_EXECUTABLE_WIN
-    elif OS == OS_LIN: default_path = constants.DEFAULT_NUKE_EXECUTABLE_LIN
-    elif OS == OS_MAC: default_path = constants.DEFAULT_NUKE_EXECUTABLE_MAC
-    else: raise EnvironmentError(f"Unsupported OS '{OS}' for Nuke.")
+    """Find the Nuke executable path.
+    
+    Returns:
+        Path to the Nuke executable
+        
+    Raises:
+        ConfigurationError: If Nuke executable is not found at the default location
+    """
+    # Use the default executable from fixenv based on OS
+    default_path = fixenv.NUKE_EXEC_PATH_DEFAULT
 
     if Path(default_path).is_file():
-        log.debug(f"Using default Nuke executable for {OS}: {default_path}")
+        log.debug(f"Using default Nuke executable for {fixenv.OS}: {default_path}")
         return normalize_path(default_path)
 
-    # If default not found, raise error (could add more search logic here if needed)
-    raise ConfigurationError(f"Nuke executable not found at default location: '{default_path}'. Set the NUKE_EXE_PATH environment variable.")
+    # If default not found, raise error
+    raise ConfigurationError(f"Nuke executable not found at default location: '{default_path}'.")
 
-# Path to the internal Nuke script relative to this utils file
-_NUKE_EXECUTOR_SCRIPT_PATH = Path(__file__).parent / constants.NUKE_EXECUTOR_SCRIPT_NAME
+# Log the Nuke executor script path
+log.info(f"Nuke Executor Script Path: {constants.NUKE_EXECUTOR_SCRIPT_PATH.absolute()}")
 
 def execute_nuke_archive_process(
     input_script_path: str,
@@ -206,35 +194,37 @@ def execute_nuke_archive_process(
     final_script_archive_path: str,
     metadata: Dict[str, Any],
     bake_gizmos: bool,
-    timeout: int = 300 # Increased default timeout
+    repath_script_flag: bool = False,
+    timeout: int = 300 
 ) -> Dict[str, Any]:
-    """
-    Executes the _nuke_executor.py script via 'nuke -t'. This performs the
-    Nuke-side process: load, prune, dep collection, bake, save final script.
-    It does NOT perform repathing or destination path mapping inside Nuke.
+    """Execute the _nuke_executor.py script via 'nuke -t'.
+    
+    This performs the Nuke-side process: load, prune, dependency collection, 
+    bake, save final script. It also handles repathing by passing a 
+    pre-calculated mapping if requested.
 
     Args:
         input_script_path: Absolute path to the original Nuke script.
-        archive_root: Absolute path to the archive destination root (passed to Nuke for context).
-        final_script_archive_path: Absolute path where the processed script should be saved by Nuke.
-        metadata: Dictionary containing vendor, show, episode, shot, etc. (passed to Nuke for context).
-        bake_gizmos: Boolean flag passed to Nuke script.
+        archive_root: Absolute path to the archive destination root.
+        final_script_archive_path: Absolute path where the processed script should be saved.
+        metadata: Dictionary containing vendor, show, episode, shot, etc.
+        bake_gizmos: Whether to bake gizmos in the script.
+        repath_script_flag: Whether to enable repathing knobs within the script.
         timeout: Timeout in seconds for the entire Nuke process.
 
     Returns:
-        Dictionary containing the results parsed from the Nuke script's JSON output.
-        Expected keys: 'status', 'final_saved_script_path', 'original_dependencies', 'errors'.
-        'original_dependencies' map contains {node.knob: {evaluated_path, ...}} as found by Nuke.
+        Dictionary containing the results from the Nuke script's JSON output.
+        Keys include: 'status', 'final_saved_script_path', 'original_dependencies', 'errors'.
 
     Raises:
         ConfigurationError: If Nuke executable or executor script not found.
-        NukeExecutionError: If the Nuke process fails critically (timeout, crash, non-zero exit).
+        NukeExecutionError: If the Nuke process fails (timeout, crash, non-zero exit).
         ParsingError: If the JSON output from Nuke cannot be parsed.
     """
     nuke_exe = get_nuke_executable() # Raises ConfigurationError if not found
 
-    if not _NUKE_EXECUTOR_SCRIPT_PATH.is_file():
-        raise FileNotFoundError(f"Core Nuke executor script missing: {_NUKE_EXECUTOR_SCRIPT_PATH}")
+    if not constants.NUKE_EXECUTOR_SCRIPT_PATH.is_file():
+        raise FileNotFoundError(f"Core Nuke executor script missing: {constants.NUKE_EXECUTOR_SCRIPT_PATH}")
 
     # Serialize metadata to JSON string for command line argument
     try:
@@ -246,15 +236,19 @@ def execute_nuke_archive_process(
     command = [
         nuke_exe,
         "-t", # Terminal mode
-        str(_NUKE_EXECUTOR_SCRIPT_PATH),
+        str(constants.NUKE_EXECUTOR_SCRIPT_PATH),
         "--input-script-path", normalize_path(input_script_path),
         "--archive-root", normalize_path(archive_root), # Pass for context
         "--final-script-archive-path", normalize_path(final_script_archive_path),
         "--metadata-json", metadata_json_string, # Pass for context
     ]
     if bake_gizmos: command.append("--bake-gizmos")
+    if repath_script_flag: command.append("--repath-script")
 
-    log.info(f"Executing Nuke process with {timeout}s timeout... (Executor: {_NUKE_EXECUTOR_SCRIPT_PATH.name})")
+    # Use environment as is - NUKE_PATH is set up in the fixarc launcher script
+    env = os.environ.copy()
+
+    log.info(f"Executing Nuke process with {timeout}s timeout... (Executor: {constants.NUKE_EXECUTOR_SCRIPT_PATH.name})")
     log.debug(f"Nuke Command: {' '.join(command)}") # Log full command at debug
     full_stdout = ""
     full_stderr = ""
@@ -268,7 +262,8 @@ def execute_nuke_archive_process(
             check=False, # Handle exit code manually
             timeout=timeout,
             encoding='utf-8',
-            errors='replace' # Handle potential weird characters in Nuke output
+            errors='replace', # Handle potential weird characters in Nuke output
+            env=env  # Use our modified environment
         )
         elapsed = time.time() - start_time
         full_stdout = process.stdout or ""
@@ -519,7 +514,7 @@ def copy_files_robustly(
 
         try:
             # --- Build Command (Robocopy/Rsync) ---
-            if OS == OS_WIN and not is_seq:
+            if fixenv.OS == fixenv.OS_WIN and not is_seq:
                  # Use robocopy for single files (less efficient but robust)
                  src_dir = str(Path(norm_source).parent)
                  src_file = Path(norm_source).name
@@ -528,7 +523,7 @@ def copy_files_robustly(
                  # Check if destination exists to decide on /IS (include same files/overwrite)
                  if not dry_run and Path(norm_dest).exists(): command.append('/IS')
                  copy_command = command
-            elif (OS == OS_LIN or OS == OS_MAC) and not is_seq:
+            elif (fixenv.OS == fixenv.OS_LIN or fixenv.OS == fixenv.OS_MAC) and not is_seq:
                  # Use rsync for single files
                  command = ['rsync', '-t', '-q', norm_source, norm_dest] # -t preserves times, -q quiet
                  copy_command = command
@@ -549,7 +544,7 @@ def copy_files_robustly(
 
                       copy_process = subprocess.run(copy_command, capture_output=True, text=True, check=False, encoding='utf-8', errors='replace')
                       # Robocopy success codes are <= 1 (or <= 3 if /IS used? Check docs). Rsync is 0.
-                      success_codes = {0, 1} if OS == OS_WIN else {0}
+                      success_codes = {0, 1} if fixenv.OS == fixenv.OS_WIN else {0}
                       if copy_process.returncode not in success_codes:
                            log.error(f"Copy command failed for '{norm_source}' (Code: {copy_process.returncode}):")
                            stdout = copy_process.stdout.strip()
@@ -603,32 +598,79 @@ def copy_files_robustly(
 # --- Metadata Extraction Wrapper ---
 def get_metadata_from_path(script_path: str) -> Dict[str, Any]:
     """
-    Extract metadata from a file path using StudioData (if available).
+    Extract metadata from a file path using StudioData.
 
     Args:
         script_path (str): Path to the script file
 
     Returns:
-        Dict[str, Any]: Dictionary containing extracted metadata, or empty if unavailable/error.
+        Dict[str, Any]: Dictionary containing extracted metadata, or empty if error.
     """
-    if not _fixenv_available or StudioData is None:
-        log.warning("Cannot extract metadata from path: 'fixenv'/'fixfx' packages not available.")
-        return {}
     try:
+        log.debug(f"Attempting to extract metadata from path: {script_path}")
         studio_data = StudioData(script_path)
-        # Return the full metadata dictionary
-        return studio_data.metadata if hasattr(studio_data, 'metadata') else {}
+        
+        # DEBUG: Inspect the StudioData object attributes
+        _debug_studio_data_object(studio_data)
+        
+        # Use the metadata property which returns a dictionary of all available properties
+        metadata = studio_data.metadata
+        
+        # Log the extracted metadata for debugging
+        if metadata:
+            log.debug(f"Successfully extracted metadata: {metadata}")
+        else:
+            log.warning(f"No metadata could be extracted from path: {script_path}")
+            
+        return metadata
     except Exception as e:
         log.warning(f"Error extracting metadata from path '{script_path}': {e}")
         return {}
+
+def _debug_studio_data_object(studio_data: Any) -> None:
+    """
+    Debug helper to inspect StudioData object properties.
+    Only runs when log level is DEBUG.
+    """
+    # Check if the current log level is more verbose than DEBUG (lower numbers are more verbose)
+    if log.getEffectiveLevel() > logging.DEBUG:
+        return
+        
+    log.debug("--- StudioData Debug Information ---")
+    
+    # Get regular attributes
+    attributes = []
+    for attr in dir(studio_data):
+        # Skip private attributes and methods
+        if attr.startswith('_') or callable(getattr(studio_data, attr)) or attr == 'metadata':
+            continue
+        
+        try:
+            value = getattr(studio_data, attr)
+            attributes.append(f"{attr}: {value}")
+        except Exception as e:
+            attributes.append(f"{attr}: <error accessing: {e}>")
+    
+    if attributes:
+        log.debug("Available attributes:")
+        for attr in sorted(attributes):
+            log.debug(f"  {attr}")
+    else:
+        log.debug("No accessible attributes found")
+    
+    # Check for common expected patterns
+    path_pattern = getattr(studio_data, 'path_pattern', None)
+    if path_pattern:
+        log.debug(f"Path pattern: {path_pattern}")
+    
+    # Output object type for debugging
+    log.debug(f"Object type: {type(studio_data).__name__}")
+    log.debug("--- End StudioData Debug Info ---")
 
 # --- Path Mapping Logic ---
 
 def load_mapping_rules(config_path: str) -> Optional[List[Dict[str, Any]]]:
     """Loads mapping rules from a YAML file."""
-    if not _yaml_available:
-        log.error("Cannot load YAML mapping rules: PyYAML package is not installed.")
-        return None
     try:
         abs_path = Path(config_path).resolve()
         if not abs_path.is_file():
@@ -663,11 +705,20 @@ def map_path_using_rules(sd: 'StudioData', rules: List[Dict[str, Any]]) -> Optio
     Returns:
         The matched relative destination path string (e.g., 'assets/images') or None if no rule matches.
     """
-    if not sd or not hasattr(sd, 'metadata'):
+    if not sd:
         log.debug("Cannot map path: Invalid StudioData object provided.")
         return None
 
-    log.debug(f"Attempting to map path using StudioData: {sd.metadata}")
+    # Extract properties from StudioData object into a dictionary
+    properties = {}
+    try:
+        for prop in dir(sd):
+            if not prop.startswith('_') and not callable(getattr(sd, prop)) and prop != 'metadata':
+                properties[prop] = getattr(sd, prop)
+    except Exception as e:
+        log.warning(f"Error extracting properties from StudioData: {e}")
+    
+    log.debug(f"Attempting to map path using StudioData properties: {properties}")
     for rule in rules:
         conditions = rule.get('conditions', {})
         destination = rule.get('destination')
@@ -685,11 +736,11 @@ def map_path_using_rules(sd: 'StudioData', rules: List[Dict[str, Any]]) -> Optio
 
         # Evaluate other conditions
         for key, expected_value in conditions.items():
-            actual_value = sd.metadata.get(key)
+            actual_value = properties.get(key)
 
             if actual_value is None:
                 match = False
-                break # Metadata key not found in StudioData
+                break # Property not found in StudioData
 
             # Condition types: exact string or list contains
             if isinstance(expected_value, list):
@@ -709,7 +760,7 @@ def map_path_using_rules(sd: 'StudioData', rules: List[Dict[str, Any]]) -> Optio
             log.debug(f"Matched rule '{rule_name}'. Conditions: {conditions}. Destination: '{destination}'")
             return str(destination) # Return first match
 
-    log.debug(f"No specific rule matched for StudioData: {sd.metadata}")
+    log.debug(f"No specific rule matched for StudioData properties: {properties}")
     return None # No rule matched
 
 def get_default_archive_path(source_path: str, archive_root: str) -> str:

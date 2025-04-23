@@ -24,6 +24,12 @@ import traceback
 import argparse
 from pathlib import Path # Use pathlib for path manipulation within Nuke
 from typing import Dict, List, Set, Optional, Tuple, Any # Use standard typing
+import tempfile
+
+# --- Simple Placeholder Exceptions (Internal) ---
+class PruningError(Exception): pass
+class ConfigurationError(Exception): pass
+class ArchiverError(Exception): pass
 
 # --- Constants (Duplicated for self-containment) ---
 WRITE_NODE_CLASSES = frozenset(["Write", "WriteGeo", "DeepWrite"])
@@ -32,6 +38,9 @@ READ_NODE_CLASSES = frozenset([
     "Axis", "Axis2", "Axis3", "OCIOFileTransform", "Vectorfield",
     "GenerateLUT", "BlinkScript", "ParticleCache", "PointCloudGenerator", "STMap",
 ])
+# Placeholder for category, mirroring simplified mapping logic below
+ELEMENTS_REL = "elements"
+
 
 # --- Helper Functions (Internal to this script) ---
 
@@ -44,12 +53,40 @@ def _log_print(level: str, message: str) -> None:
 def _is_valid_writefix(node: nuke.Node) -> bool:
     """Check if a Group node is a WriteFix gizmo excluding 'QuickReview'."""
     if node.Class() != 'Group': return False
-    if not node.knob('writefix'): return False
+    if not node.knob('writefix'): return False # Check for identifying knob
     profile_knob = node.knob('profile')
     if profile_knob and profile_knob.value() == 'QuickReview':
         _log_print("debug", f"Ignoring WriteFix '{node.fullName()}' (QuickReview profile)")
         return False
     return True
+
+# --- Action: Get Write Nodes (Copied and adapted from nuke_ops.py) ---
+def get_write_nodes_action() -> Dict[str, List[str]]:
+    """Finds all relevant Write and WriteFix nodes in the current script."""
+    writes = []
+    nodes = nuke.allNodes(recurseGroups=True)
+    _log_print("info", f"Checking {len(nodes)} total nodes for target writes...")
+    count = 0
+    for node in nodes:
+        is_write = False
+        node_class = node.Class()
+        if node_class in WRITE_NODE_CLASSES:
+             is_write = True
+        elif _is_valid_writefix(node): # Use the helper defined above
+             is_write = True
+
+        if is_write:
+            # Optionally check if the write node is disabled
+            disable_knob = node.knob('disable')
+            if disable_knob and disable_knob.value():
+                 _log_print("debug", f"Ignoring disabled write node: {node.fullName()}")
+                 continue
+            _log_print("debug", f"Found valid write node: {node.fullName()} (Class: {node_class})")
+            writes.append(node.fullName())
+            count += 1
+    _log_print("info", f"Found {count} valid write nodes.")
+    return {"write_nodes": writes}
+
 
 def _get_upstream_nodes(target_nodes: List[nuke.Node]) -> Set[nuke.Node]:
     """Traces all upstream dependencies for a list of target nodes."""
@@ -136,9 +173,10 @@ def _collect_dependency_paths(nodes: Set[nuke.Node]) -> Dict[str, Dict[str, Any]
     dependency_paths: Dict[str, Dict[str, Any]] = {}
     _log_print("info", f"Collecting dependency paths from {len(nodes)} nodes...")
 
-    for node in nodes:
+    for i, node in enumerate(nodes): # Added index for logging
         node_name = node.fullName()
         node_class = node.Class()
+        _log_print("debug", f"Processing node {i+1}/{len(nodes)}: '{node_name}' (Class: {node_class})") # Log node being processed
         # Define relevant knobs per class or check common ones
         knobs_to_check: Dict[str, nuke.Knob] = {}
         if node_class in READ_NODE_CLASSES | WRITE_NODE_CLASSES: # Check both for file knobs
@@ -155,6 +193,7 @@ def _collect_dependency_paths(nodes: Set[nuke.Node]) -> Dict[str, Dict[str, Any]
             original_path = None
             evaluated_path = None
             error_msg = None
+            _log_print("debug", f"  Checking knob: '{knob_name}' on node '{node_name}'") # Log knob being checked
             try:
                 original_path = knob.value()
                 if not original_path: continue # Skip empty knobs
@@ -241,9 +280,6 @@ def _bake_gizmos(nodes_to_check: Set[nuke.Node]) -> Tuple[int, Set[nuke.Node]]:
 
              if not in_nuke_plugins_dir:
                   should_bake = True
-                  _log_print("debug", f"Identified file-based non-native gizmo: {node_name}")
-             else:
-                  _log_print("debug", f"Skipping default/plugin path gizmo: {node_name}")
         # Decide if non-file-based, non-native nodes should be baked (risky)
         # elif not is_likely_native:
         #      _log_print("warning", f"Node {node_name} ({node_class}) is non-native but not file-based. Baking not attempted.")
@@ -370,200 +406,371 @@ def _repath_nodes(
          _log_print("warning", f"Encountered {len(failed_repaths)} issues during repathing. Check logs.")
     return repath_count
 
-# --- Main Executor Function ---
+# --- Main Executor Function and Task-Specific Functions ---
+
+def load_input_script(script_path: str) -> None:
+    """
+    Loads the input Nuke script.
+    """
+    _log_print("info", f"Loading input script: {script_path}")
+    nuke.scriptClear()
+    nuke.scriptOpen(script_path)
+    _log_print("info", "Input script loaded successfully.")
+
+def identify_target_writes() -> List[nuke.Node]:
+    """
+    Identifies target write nodes in the script.
+    Returns a list of target write nodes.
+    """
+    _log_print("info", "Identifying target write nodes...")
+    write_node_names = get_write_nodes_action().get("write_nodes", [])
+    if not write_node_names:
+        raise PruningError("No valid Write/WriteFix nodes found to initiate pruning.")
+    
+    target_write_nodes = [nuke.toNode(name) for name in write_node_names if nuke.toNode(name)]
+    _log_print("info", f"Found {len(target_write_nodes)} target write nodes for dependency tracing.")
+    return target_write_nodes
+
+def trace_node_dependencies(target_nodes: List[nuke.Node]) -> Set[nuke.Node]:
+    """
+    Traces dependencies for the given target nodes.
+    Returns a set of required compute nodes.
+    """
+    _log_print("info", "Tracing node dependencies...")
+    required_compute_nodes = _get_upstream_nodes(target_nodes)
+    return required_compute_nodes
+
+def find_backdrop_nodes(compute_nodes: Set[nuke.Node]) -> Set[nuke.Node]:
+    """
+    Finds backdrop nodes associated with the given compute nodes.
+    Returns a set of associated backdrop nodes.
+    """
+    _log_print("info", "Finding associated backdrops...")
+    return _find_associated_backdrops(compute_nodes)
+
+def collect_required_nodes(compute_nodes: Set[nuke.Node], backdrop_nodes: Set[nuke.Node]) -> Tuple[Set[nuke.Node], List[str]]:
+    """
+    Combines compute nodes and backdrop nodes to get the final set of required nodes.
+    Returns the combined set and a sorted list of node names.
+    """
+    required_nodes = compute_nodes.union(backdrop_nodes)
+    required_node_names = sorted([n.fullName() for n in required_nodes])
+    _log_print("info", f"Total nodes required (including backdrops): {len(required_nodes)}")
+    return required_nodes, required_node_names
+
+def collect_dependency_paths_from_nodes(nodes: Set[nuke.Node]) -> Dict[str, Dict[str, Any]]:
+    """
+    Collects file dependencies from the given nodes.
+    Returns a dictionary of dependency information.
+    """
+    _log_print("info", "Collecting dependency file paths from required nodes...")
+    return _collect_dependency_paths(nodes)
+
+def process_gizmo_baking(nodes: Set[nuke.Node], should_bake: bool) -> Tuple[int, Set[nuke.Node]]:
+    """
+    Bakes gizmos if requested.
+    Returns the count of baked gizmos and the potentially updated set of nodes.
+    """
+    baked_count = 0
+    if should_bake:
+        _log_print("info", "--- Starting Optional Step: Bake Gizmos ---")
+        baked_count, nodes = _bake_gizmos(nodes)
+        _log_print("info", "--- Finished Optional Step: Bake Gizmos ---")
+    else:
+        _log_print("info", "Skipping gizmo baking.")
+    
+    return baked_count, nodes
+
+def repath_script_knobs(
+    nodes: Set[nuke.Node], 
+    dependency_info: Dict[str, Dict[str, Any]],
+    should_repath: bool,
+    archive_root: str,
+    final_script_path: str,
+    metadata_json: str
+) -> Tuple[Dict[str, str], int]:
+    """
+    Repaths script knobs if requested.
+    Returns the dependency map for repathing and the count of repathed knobs.
+    """
+    dependency_map_for_repath: Dict[str, str] = {}
+    repath_count = 0
+    
+    if not should_repath:
+        _log_print("info", "Skipping script repathing.")
+        return dependency_map_for_repath, repath_count
+        
+    _log_print("info", "--- Starting Optional Step: Repath Script ---")
+    if not final_script_path:
+        raise ConfigurationError("Final script archive path is required for repathing.")
+    if not archive_root:
+        raise ConfigurationError("Archive root path is required for repathing.")
+
+    # For each dependency path collected earlier, calculate its final destination.
+    _log_print("debug", "Calculating final archive paths for repathing...")
+    temp_metadata = json.loads(metadata_json)
+    
+    # First process each dependency to map to archive destination
+    for node_knob, data in dependency_info.items():
+        orig_eval = data.get("evaluated_path")
+        if orig_eval and not data.get("error"):  # Only map valid, evaluated paths
+            # Simulate mapping using standard SPT structure
+            try:
+                # Use consistent approach for all file paths
+                filename = Path(orig_eval).name
+                # Use elements as default category
+                category = ELEMENTS_REL
+                # Construct standard path
+                base = Path(archive_root) / temp_metadata['vendor'] / temp_metadata['show']
+                if temp_metadata.get('season'): base /= temp_metadata['season']
+                base /= temp_metadata['episode'] / temp_metadata['shot']
+                dest_path = base / category / filename
+                
+                # Store with normalized paths
+                dependency_map_for_repath[orig_eval] = str(dest_path).replace("\\","/")
+                _log_print("debug", f"Mapped '{orig_eval}' → '{dependency_map_for_repath[orig_eval]}'")
+            except Exception as map_e:
+                _log_print("error", f"Could not calculate destination for repathing '{orig_eval}': {map_e}")
+
+    # Now repath the knobs in memory
+    repath_count = _repath_nodes(nodes, dependency_map_for_repath, final_script_path)
+    _log_print("info", f"--- Finished Optional Step: Repath Script ({repath_count} paths updated) ---")
+    
+    return dependency_map_for_repath, repath_count
+
+def save_pruned_script(nodes: Set[nuke.Node], final_script_path: str, archive_root: str) -> str:
+    """
+    Saves a new Nuke script containing only the specified nodes while retaining
+    the original script's Root settings like format, frame range, and color settings.
+
+    Args:
+        nodes: A set of nuke.Node instances to keep.
+        final_script_path: Path where the new script should be saved.
+        archive_root: Root directory for the archive, used for temp file storage.
+
+    Returns:
+        Path to the saved .nk file.
+    """
+    _log_print("info", "Starting pruned script save process.")
+
+    if not final_script_path:
+        raise ConfigurationError("Final script archive path is required.")
+    
+    if not archive_root:
+        raise ConfigurationError("Archive root is required.")
+    
+    # Backup Root node settings
+    root_data = nuke.root().writeKnobs(nuke.WRITE_ALL | nuke.TO_SCRIPT)
+    _log_print("debug", "Root settings serialized successfully")
+
+    # Deselect all and select only target nodes
+    for n in nuke.allNodes(recurseGroups=True):
+        n.setSelected(False)
+
+    final_node_names = [n.fullName() for n in nodes if nuke.exists(n.fullName())]
+    nodes_selected_count = 0
+    missing_final_nodes = []
+    for name in final_node_names:
+        node = nuke.toNode(name)
+        if node:
+            try:
+                node.setSelected(True)
+                nodes_selected_count += 1
+            except Exception as sel_e:
+                _log_print("warning", f"Could not select final node '{name}': {sel_e}")
+        else:
+            _log_print("warning", f"Required node '{name}' not found in final state before saving.")
+            missing_final_nodes.append(name)
+
+    if nodes_selected_count == 0:
+        raise PruningError("No nodes were selected for saving. Pruning or baking might have removed everything.")
+
+    _log_print("info", f"Selected {nodes_selected_count} final nodes for saving.")
+    if missing_final_nodes:
+        _log_print("warning", f"Missing {len(missing_final_nodes)} required nodes in final state.")
+
+    # Create a custom temp directory under archive_root
+    temp_nodes_file = None
+    try:
+        # Create .tmp directory under archive_root if it doesn't exist
+        temp_dir = os.path.join(archive_root, ".tmp")
+        os.makedirs(temp_dir, exist_ok=True)
+        _log_print("debug", f"Using custom temp directory: {temp_dir}")
+        
+        # Generate a unique filename for the temp file
+        import uuid
+        temp_filename = f"nodes_{uuid.uuid4().hex}.nk"
+        temp_nodes_file = os.path.join(temp_dir, temp_filename)
+        
+        # Copy selected nodes to temp file
+        _log_print("debug", f"Saving selected nodes to custom temp file: {temp_nodes_file}")
+        nuke.nodeCopy(temp_nodes_file)
+        
+        # Clear and rebuild
+        nuke.scriptClear()
+        
+        # Restore root settings
+        try:
+            nuke.root().readKnobs(root_data)
+            _log_print("debug", "Root settings restored successfully")
+        except Exception as e:
+            _log_print("warning", f"Failed to fully restore root settings: {e}")
+        
+        # Paste nodes from temp file
+        if os.path.exists(temp_nodes_file) and os.path.getsize(temp_nodes_file) > 0:
+            _log_print("debug", "Pasting nodes from custom temp file")
+            nuke.nodePaste(temp_nodes_file)
+        else:
+            raise PruningError(f"Failed to save nodes to custom temp file: {temp_nodes_file}")
+            
+        # Ensure output directory exists
+        final_script_dir = os.path.dirname(final_script_path)
+        if final_script_dir:
+            os.makedirs(final_script_dir, exist_ok=True)
+            _log_print("info", f"Ensured final script directory exists: {final_script_dir}")
+        
+        # Save the script
+        nuke.scriptSaveAs(filename=final_script_path, overwrite=1)
+        
+        # Final verification
+        if not os.path.exists(final_script_path) or os.path.getsize(final_script_path) == 0:
+            raise ArchiverError(f"Final save failed: Output file '{final_script_path}' is missing or empty.")
+        
+        _log_print("info", "Final script saved successfully.")
+        return final_script_path
+        
+    finally:
+        # Clean up temporary file
+        if temp_nodes_file and os.path.exists(temp_nodes_file):
+            try:
+                os.remove(temp_nodes_file)
+                _log_print("debug", f"Removed custom temp file: {temp_nodes_file}")
+            except Exception as e:
+                _log_print("warning", f"Failed to remove custom temp file {temp_nodes_file}: {e}")
+
+def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_root: str, metadata_json: str) -> Dict[str, str]:
+    """
+    Generates the final dependency map for copying files.
+    Returns the mapping from original paths to archive paths.
+    """
+    dependencies_to_copy = {}
+    _log_print("debug", "Generating final dependency map for copying...")
+    temp_metadata = json.loads(metadata_json)
+    
+    for node_knob, data in dependency_info.items():
+        orig_eval = data.get("evaluated_path")
+        if orig_eval and not data.get("error"):  # Only map valid paths
+            try:
+                # Use same mapping logic as repathing for consistency
+                filename = Path(orig_eval).name
+                category = ELEMENTS_REL  # Use standard elements category
+                base = Path(archive_root) / temp_metadata['vendor'] / temp_metadata['show']
+                if temp_metadata.get('season'): base /= temp_metadata['season']
+                base /= temp_metadata['episode'] / temp_metadata['shot']
+                dest_path = base / category / filename
+                
+                # Store with normalized paths
+                dependencies_to_copy[orig_eval] = str(dest_path).replace("\\","/")
+            except Exception as map_e:
+                _log_print("error", f"Could not calculate destination for copying '{orig_eval}': {map_e}")
+    
+    return dependencies_to_copy
+
 def run_nuke_tasks(args: argparse.Namespace) -> Dict[str, Any]:
     """
     Performs the core Nuke logic: load, prune, collect deps, bake, repath, save.
     """
-    results: Dict[str, Any] = {"status": "failure"} # Default status
-    required_nodes: Set[nuke.Node] = set()
-    dependency_info: Dict[str, Dict[str, Any]] = {} # node.knob -> {data}
-    final_saved_script_path: Optional[str] = None
-    original_script_filename = Path(args.input_script_path).name
+    results: Dict[str, Any] = {"status": "failure"}  # Default status
+    errors = []
+    _log_print("info", "--- Starting Nuke Task Execution ---") # Start Task Log
+    # Log relevant environment variables
+    _log_print("debug", f"NUKE_PATH env: {os.environ.get('NUKE_PATH', 'Not Set')}")
 
     try:
         # 1. Load Input Script
-        _log_print("info", f"Loading input script: {args.input_script_path}")
-        nuke.scriptClear()
-        nuke.scriptOpen(args.input_script_path)
-        _log_print("info", "Input script loaded successfully.")
-
+        _log_print("info", "Step 1: Loading Input Script...")
+        load_input_script(args.input_script_path)
+        _log_print("info", "Step 1: Load Input Script COMPLETED.")
+        
         # 2. Identify Target Writes
-        _log_print("info", "Identifying target write nodes...")
-        write_node_names = get_write_nodes_action().get("write_nodes", [])
-        if not write_node_names:
-             raise PruningError("No valid Write/WriteFix nodes found to initiate pruning.")
-        target_write_nodes = [nuke.toNode(name) for name in write_node_names if nuke.toNode(name)]
-        _log_print("info", f"Found {len(target_write_nodes)} target write nodes for dependency tracing.")
-
+        _log_print("info", "Step 2: Identifying Target Writes...")
+        target_write_nodes = identify_target_writes()
+        _log_print("info", f"Step 2: Identify Target Writes COMPLETED. Found {len(target_write_nodes)} targets.")
+        
         # 3. Trace Dependencies
-        _log_print("info", "Tracing node dependencies...")
-        required_compute_nodes = _get_upstream_nodes(target_write_nodes)
-
+        _log_print("info", "Step 3: Tracing Node Dependencies...")
+        required_compute_nodes = trace_node_dependencies(target_write_nodes)
+        _log_print("info", f"Step 3: Trace Node Dependencies COMPLETED. Found {len(required_compute_nodes)} compute nodes.")
+        
         # 4. Find Associated Backdrops
-        _log_print("info", "Finding associated backdrops...")
-        associated_backdrops = _find_associated_backdrops(required_compute_nodes)
-
+        _log_print("info", "Step 4: Finding Associated Backdrops...")
+        associated_backdrops = find_backdrop_nodes(required_compute_nodes)
+        _log_print("info", f"Step 4: Find Associated Backdrops COMPLETED. Found {len(associated_backdrops)} backdrops.")
+        
         # 5. Final Set of Nodes to Keep
-        required_nodes = required_compute_nodes.union(associated_backdrops)
-        required_node_names = sorted([n.fullName() for n in required_nodes])
-        _log_print("info", f"Total nodes required (including backdrops): {len(required_nodes)}")
-        results["nodes_kept"] = required_node_names # Add to results
-
-        # 6. Collect Dependency Paths *from required nodes only*
-        _log_print("info", "Collecting dependency file paths from required nodes...")
-        dependency_info = _collect_dependency_paths(required_nodes)
-        results["original_dependencies"] = dependency_info # Add raw paths to results
-
-        # 7. Bake Gizmos (Optional, operates on the required nodes in memory)
-        baked_count = 0
-        if args.bake_gizmos:
-            _log_print("info", "--- Starting Optional Step: Bake Gizmos ---")
-            baked_count, required_nodes = _bake_gizmos(required_nodes) # Updates the set
-            results["gizmos_baked_count"] = baked_count
-            # Update required_node_names if set changed significantly? Maybe not necessary.
-            _log_print("info", "--- Finished Optional Step: Bake Gizmos ---")
-        else:
-            _log_print("info", "Skipping gizmo baking.")
-            results["gizmos_baked_count"] = 0
-
+        _log_print("info", "Step 5: Collecting Final Required Nodes...")
+        required_nodes, required_node_names = collect_required_nodes(required_compute_nodes, associated_backdrops)
+        results["nodes_kept"] = required_node_names
+        _log_print("info", f"Step 5: Collect Final Required Nodes COMPLETED. Total {len(required_nodes)} nodes.")
+        
+        # 6. Collect Dependency Paths
+        _log_print("info", "Step 6: Collecting Dependency Paths...")
+        dependency_info = collect_dependency_paths_from_nodes(required_nodes)
+        results["original_dependencies"] = dependency_info
+        _log_print("info", f"Step 6: Collect Dependency Paths COMPLETED. Found {len(dependency_info)} potential paths.")
+        
+        # 7. Bake Gizmos (Optional)
+        _log_print("info", "Step 7: Processing Gizmo Baking (Optional)...")
+        baked_count, required_nodes = process_gizmo_baking(required_nodes, args.bake_gizmos)
+        results["gizmos_baked_count"] = baked_count
+        _log_print("info", f"Step 7: Process Gizmo Baking COMPLETED. Baked {baked_count} gizmos. Node count now {len(required_nodes)}.")
+        
         # 8. Calculate Final Paths and Repath Knobs (Optional)
-        dependency_map_for_repath: Dict[str, str] = {} # {original_eval_abs: final_archive_abs}
-        repath_count = 0
-        if args.repath_script:
-            _log_print("info", "--- Starting Optional Step: Repath Script ---")
-            if not args.final_script_archive_path:
-                 raise ConfigurationError("Final script archive path is required for repathing.")
-            if not args.archive_root:
-                 raise ConfigurationError("Archive root path is required for repathing.")
-
-            # We need the mapping from original path to *intended* archive path
-            # This requires the mapping logic (like archive_utils.map_dependency_to_archive_path)
-            # Re-implementing basic mapping here or passing it? Let's assume args contain necessary metadata.
-            # For each dependency path collected earlier, calculate its final destination.
-            _log_print("debug", "Calculating final archive paths for repathing...")
-            temp_metadata = json.loads(args.metadata_json) # Load metadata passed as JSON string
-            for data in dependency_info.values():
-                orig_eval = data.get("evaluated_path")
-                if orig_eval and not data.get("error"): # Only map valid, evaluated paths
-                     # Simulate mapping (needs archive_utils logic here ideally)
-                     # This is where the dependency on archive_utils becomes apparent
-                     # Let's assume a simplified mapping for now:
-                     try:
-                          # Re-implement basic mapping for repath calculation
-                          filename = Path(orig_eval).name
-                          # Simplified category - assume 'elements' for now
-                          category = constants.ELEMENTS_REL # Needs refinement
-                          # Need to reconstruct get_spt_directory logic here or pass map
-                          # For now, construct path manually based on args
-                          base = Path(args.archive_root) / temp_metadata['vendor'] / temp_metadata['show']
-                          if temp_metadata.get('season'): base /= temp_metadata['season']
-                          base /= temp_metadata['episode'] / temp_metadata['shot']
-                          dest_path = base / category / filename
-                          dependency_map_for_repath[orig_eval] = str(dest_path).replace("\\","/")
-                     except Exception as map_e:
-                          _log_print("error", f"Could not calculate destination for repathing '{orig_eval}': {map_e}")
-
-            # Now repath the knobs in memory
-            repath_count = _repath_nodes(required_nodes, dependency_map_for_repath, args.final_script_archive_path)
-            results["repath_count"] = repath_count
-            _log_print("info", "--- Finished Optional Step: Repath Script ---")
-        else:
-            _log_print("info", "Skipping script repathing.")
-            results["repath_count"] = 0
-
-
+        _log_print("info", "Step 8: Repathing Script Knobs (Optional)...")
+        dependency_map_for_repath, repath_count = repath_script_knobs(
+            required_nodes, 
+            dependency_info, 
+            args.repath_script,
+            args.archive_root, 
+            args.final_script_archive_path,
+            args.metadata_json
+        )
+        results["repath_count"] = repath_count
+        _log_print("info", f"Step 8: Repath Script Knobs COMPLETED. Repathed {repath_count} knobs.")
+        
         # 9. Select Required Nodes and Save Final Script
-        _log_print("info", "Preparing to save final processed script...")
-        if not args.final_script_archive_path:
-             raise ConfigurationError("Final script archive path is required for saving.")
-
-        # Deselect everything
-        for n in nuke.allNodes(recurseGroups=True): n.setSelected(False)
-
-        # Select only the nodes that should remain (use names for reliability)
-        final_node_names = [n.fullName() for n in required_nodes if nuke.exists(n.fullName())]
-        nodes_selected_count = 0
-        missing_final_nodes = []
-        for name in final_node_names:
-             node = nuke.toNode(name) # Find node again by name in current state
-             if node:
-                  try:
-                       node.setSelected(True)
-                       nodes_selected_count += 1
-                  except Exception as sel_e:
-                       _log_print("warning", f"Could not select final node '{name}': {sel_e}")
-             else:
-                  # This implies a node that was required got deleted during baking? Should not happen often.
-                  _log_print("warning", f"Required node '{name}' not found in final state before saving.")
-                  missing_final_nodes.append(name)
-
-        if nodes_selected_count == 0:
-             raise PruningError("No nodes were selected for saving. Pruning or baking might have removed everything.")
-
-        _log_print("info", f"Selected {nodes_selected_count} final nodes for saving.")
-        if missing_final_nodes:
-             _log_print("warning", f"Missing {len(missing_final_nodes)} required nodes in final state.")
-
-        # Perform the save using nuke.copyNodes() and scriptSaveAs()
-        _log_print("info", f"Saving final script to: {args.final_script_archive_path}")
-        nuke.copyNodes(nuke.selectedNodes()) # Copy selected to clipboard
-        nuke.scriptClear() # Clear current state
-        nuke.nodePaste('%clipboard%') # Paste into new state
-
-        # Check if paste worked
-        if not nuke.allNodes():
-            raise PruningError("Pasting nodes failed before final save. New script state is empty.")
-
-        # Create output directory if it doesn't exist
-        final_script_dir = os.path.dirname(args.final_script_archive_path)
-        if final_script_dir and not os.path.exists(final_script_dir):
-            os.makedirs(final_script_dir)
-            _log_print("info", f"Created final script directory: {final_script_dir}")
-
-        nuke.scriptSaveAs(filename=args.final_script_archive_path, overwrite=1)
-
-        # Final verification
-        if not os.path.exists(args.final_script_archive_path) or os.path.getsize(args.final_script_archive_path) == 0:
-             raise ArchiverError(f"Final save failed: Output file '{args.final_script_archive_path}' is missing or empty.")
-
-        final_saved_script_path = args.final_script_archive_path
-        _log_print("info", "Final script saved successfully.")
+        _log_print("info", "Step 9: Saving Pruned Script...")
+        final_saved_script_path = save_pruned_script(required_nodes, args.final_script_archive_path, args.archive_root)
+        _log_print("info", "Step 9: Save Pruned Script COMPLETED.")
+        
+        # Mark as success after all operations complete
         results["status"] = "success"
+        results["final_saved_script_path"] = final_saved_script_path
+        _log_print("info", "--- All Nuke Tasks Completed Successfully (pre-dependency map) ---") # Success Log pre-map
+        
+        # Generate the dependency map for copying files
+        _log_print("info", "Step 10: Generating Final Dependency Map for Copying...")
+        if results["status"] == "success":
+            dependencies_to_copy = generate_dependency_map(
+                dependency_info, 
+                args.archive_root, 
+                args.metadata_json
+            )
+            results["dependencies_to_copy"] = dependencies_to_copy
+            _log_print("info", f"Step 10: Generate Final Dependency Map COMPLETED. Found {len(dependencies_to_copy)} files to copy.")
+        else:
+            _log_print("warning", "Skipping final dependency map generation due to earlier failure.")
 
     except Exception as e:
         # Catch all errors during the process
         results["status"] = "failure"
         error_msg = f"Error during Nuke processing: {e}\n{traceback.format_exc()}"
-        results["errors"] = results.get("errors", []) + [error_msg]
+        errors.append(error_msg)
+        _log_print("error", f"--- Nuke Task Execution FAILED ---") # Failure Log
         _log_print("error", error_msg)
-
-    # --- Prepare final JSON output ---
-    results["final_saved_script_path"] = final_saved_script_path
-    # Generate the dependency map needed for copying: {original_eval_abs: final_archive_abs}
-    dependencies_to_copy = {}
-    if results["status"] == "success" and args.final_script_archive_path: # Only generate map on success
-         _log_print("debug", "Generating final dependency map for copying...")
-         temp_metadata = json.loads(args.metadata_json)
-         for data in dependency_info.values():
-             orig_eval = data.get("evaluated_path")
-             if orig_eval and not data.get("error"):
-                  try:
-                       # Reuse mapping logic (simplified again)
-                       filename = Path(orig_eval).name
-                       category = constants.ELEMENTS_REL # Needs refinement
-                       base = Path(args.archive_root) / temp_metadata['vendor'] / temp_metadata['show']
-                       if temp_metadata.get('season'): base /= temp_metadata['season']
-                       base /= temp_metadata['episode'] / temp_metadata['shot']
-                       dest_path = base / category / filename
-                       dependencies_to_copy[orig_eval] = str(dest_path).replace("\\","/")
-                  except Exception as map_e:
-                       _log_print("error", f"Could not calculate destination for copying '{orig_eval}': {map_e}")
-                       results["errors"] = results.get("errors", []) + [f"Copy map error for {orig_eval}: {map_e}"]
-
-
-    results["dependencies_to_copy"] = dependencies_to_copy
-
+    
+    results["errors"] = errors
+    _log_print("info", f"--- Finishing Nuke Task Execution (Status: {results.get('status', 'unknown')}) ---") # End Task Log
     return results
 
 

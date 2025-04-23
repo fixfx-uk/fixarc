@@ -9,6 +9,7 @@ This version modifies sys.path and uses runpy to execute the module.
 import sys
 import os
 import runpy
+import platform
 
 def main():
     """Modify sys.path and use runpy to run the fixarc CLI module."""
@@ -26,14 +27,70 @@ def main():
         else:
             print(f"[Wrapper] Project root already in sys.path: {project_root}", file=sys.stderr)
 
-        # Modify sys.argv: runpy expects the script name to be the first arg,
-        # but when running a module, the module path effectively becomes argv[0].
-        # We need to replace our wrapper script name with the target module path
-        # or simply remove it, as the module itself will handle sys.argv[1:].
-        # Let's keep it simple and let runpy handle argv based on the module.
-        # Note: runpy modifies sys.argv internally while running the module.
-        # We are passing sys.argv directly, which includes our wrapper path
-        # and the user arguments. The module should still parse sys.argv[1:].
+        # --- Set up NUKE_PATH environment variable before running the CLI ---
+        print(f"[Wrapper] Original NUKE_PATH: {os.environ.get('NUKE_PATH', 'Not Set')}", file=sys.stderr)
+        
+        # Helper function to normalize paths
+        def normalize_path(path):
+            return str(path).replace("\\", "/")
+        
+        # Try to find additional plugin paths that might be needed
+        plugin_paths = []
+        
+        # Check if DasGrain path exists and add it
+        dasgrain_paths = [
+            "Z:/pipe/plugins/nuke/DasGrain",
+            "//192.168.14.252/FixStore/pipe/plugins/nuke/DasGrain"
+        ]
+        for path in dasgrain_paths:
+            if os.path.exists(path):
+                plugin_paths.append(normalize_path(path))
+                print(f"[Wrapper] Added DasGrain plugin path: {path}", file=sys.stderr)
+        
+        # Try importing fixenv for more paths
+        try:
+            # First add fixenv to path if needed
+            if os.path.exists(os.path.join(project_root, '..', 'fixenv')):
+                fixenv_path = os.path.abspath(os.path.join(project_root, '..', 'fixenv'))
+                if fixenv_path not in sys.path:
+                    sys.path.insert(0, fixenv_path)
+                    print(f"[Wrapper] Added fixenv to sys.path: {fixenv_path}", file=sys.stderr)
+            
+            # Now try to import
+            from fixenv import NUKE_MAIN_PATH
+            nuke_main_path = str(NUKE_MAIN_PATH)
+            print(f"[Wrapper] Found fixenv.NUKE_MAIN_PATH: {nuke_main_path}", file=sys.stderr)
+            plugin_paths.append(nuke_main_path)
+            
+            # Also try to get other plugin paths from fixenv
+            try:
+                from fixenv import NUKE_PLUGIN_PATH
+                if NUKE_PLUGIN_PATH:
+                    plugin_paths.append(str(NUKE_PLUGIN_PATH))
+                    print(f"[Wrapper] Found fixenv.NUKE_PLUGIN_PATH: {NUKE_PLUGIN_PATH}", file=sys.stderr)
+            except ImportError:
+                print("[Wrapper] NUKE_PLUGIN_PATH not available in fixenv", file=sys.stderr)
+        except ImportError:
+            print("[Wrapper] Could not import NUKE_MAIN_PATH from fixenv", file=sys.stderr)
+        
+        # Get existing NUKE_PATH or initialize empty
+        nuke_path = os.environ.get('NUKE_PATH', '')
+        
+        # Determine path separator based on OS
+        path_sep = ';' if platform.system() == 'Windows' else ':'
+        
+        # Combine all paths
+        if plugin_paths:
+            joined_plugin_paths = path_sep.join(plugin_paths)
+            if nuke_path:
+                nuke_path = f"{joined_plugin_paths}{path_sep}{nuke_path}"
+            else:
+                nuke_path = joined_plugin_paths
+                
+        os.environ['NUKE_PATH'] = nuke_path
+        print(f"[Wrapper] Set NUKE_PATH: {nuke_path}", file=sys.stderr)
+        
+        # --- End of NUKE_PATH setup ---
 
         target_module = "fixarc.cli" # Use fully qualified module name with package prefix
         print(f"[Wrapper] Attempting to run module '{target_module}' with sys.path: {sys.path}", file=sys.stderr)

@@ -6,6 +6,7 @@ from pathlib import Path
 # Make sure all necessary types are imported from typing
 from typing import Dict, Any, Optional, Tuple # Added Tuple just in case, ensure Dict is here
 import os
+import re
 
 from . import constants, log
 from .utils import normalize_path, ensure_ltfs_safe # Use general utils for path safety
@@ -23,7 +24,6 @@ def _get_spt_directory(
     Args:
         archive_root: The absolute root path of the archive destination.
         metadata: Dictionary containing required keys ('vendor', 'show', 'episode', 'shot').
-                  'season' key is ignored.
         relative_category_path: The relative path within the shot folder determined by
                                 mapping rules (e.g., 'assets/images', 'projects/nuke').
                                 If empty, returns the base shot directory path.
@@ -40,7 +40,6 @@ def _get_spt_directory(
         # --- Sanitize metadata components used in the path ---
         def sanitize_for_path(value: Optional[Any], key_name: str) -> str:
             """Ensure string, basic sanitize, check non-empty."""
-            # Season is no longer special
             if value is None or value == '' or str(value).strip() == '':
                 raise ValueError(f"Required metadata key '{key_name}' cannot be empty.")
 
