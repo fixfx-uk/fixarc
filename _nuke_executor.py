@@ -43,11 +43,8 @@ def log_nuke_path_on_load():
     
     # Check if OCIOColorSpace exists
     try:
-        colorspaces = []
-        if 'OCIO_ACTIVE_CONFIG' in os.environ:
-            log.debug(f"OCIO_ACTIVE_CONFIG: {os.environ['OCIO_ACTIVE_CONFIG']}")
-        if nuke.env.get('ocioConfigPath'):
-            log.debug(f"nuke.env['ocioConfigPath']: {nuke.env.get('ocioConfigPath')}")
+        if 'OCIO' in os.environ:
+            log.debug(f"OCIO: {os.environ['OCIO']}")
         ocio_plugin = nuke.plugins(nuke.ALL | nuke.NODIR)
         plugin_list = ", ".join(ocio_plugin)
         log.debug(f"Nuke plugins: {plugin_list[:200]}...")
@@ -93,21 +90,25 @@ def _is_valid_writefix(node: nuke.Node) -> bool:
 
 # --- Action: Get Write Nodes (Copied and adapted from nuke_ops.py) ---
 def get_write_nodes_action() -> Dict[str, List[str]]:
-    """Finds all relevant Write and WriteFix nodes in the current script."""
+    """
+    Finds Write and WriteFix nodes at the root level of the Nuke script only.
+    Does not recurse into groups to find nested write nodes.
+    """
     writes = []
-    nodes = nuke.allNodes(recurseGroups=True)
-    _log_print("info", f"Checking {len(nodes)} total nodes for target writes...")
+    # Only search root level nodes (no recurseGroups)
+    nodes = nuke.allNodes()
+    _log_print("info", f"Checking {len(nodes)} root level nodes for target writes...")
     count = 0
     for node in nodes:
         is_write = False
         node_class = node.Class()
         if node_class in WRITE_NODE_CLASSES:
              is_write = True
-        elif _is_valid_writefix(node): # Use the helper defined above
+        elif _is_valid_writefix(node):
              is_write = True
 
         if is_write:
-            # Optionally check if the write node is disabled
+            # Check if the write node is disabled
             disable_knob = node.knob('disable')
             if disable_knob and disable_knob.value():
                  _log_print("debug", f"Ignoring disabled write node: {node.fullName()}")
@@ -115,7 +116,7 @@ def get_write_nodes_action() -> Dict[str, List[str]]:
             _log_print("debug", f"Found valid write node: {node.fullName()} (Class: {node_class})")
             writes.append(node.fullName())
             count += 1
-    _log_print("info", f"Found {count} valid write nodes.")
+    _log_print("info", f"Found {count} valid root level write nodes.")
     return {"write_nodes": writes}
 
 
@@ -207,7 +208,7 @@ def _collect_dependency_paths(nodes: Set[nuke.Node]) -> Dict[str, Dict[str, Any]
     for i, node in enumerate(nodes): # Added index for logging
         node_name = node.fullName()
         node_class = node.Class()
-        _log_print("debug", f"Processing node {i+1}/{len(nodes)}: '{node_name}' (Class: {node_class})") # Log node being processed
+        # _log_print("debug", f"Processing node {i+1}/{len(nodes)}: '{node_name}' (Class: {node_class})") # Log node being processed
         # Define relevant knobs per class or check common ones
         knobs_to_check: Dict[str, nuke.Knob] = {}
         if node_class in READ_NODE_CLASSES | WRITE_NODE_CLASSES: # Check both for file knobs
@@ -553,7 +554,6 @@ def repath_script_knobs(
                 category = ELEMENTS_REL
                 # Construct standard path
                 base = Path(archive_root) / temp_metadata['vendor'] / temp_metadata['show']
-                if temp_metadata.get('season'): base /= temp_metadata['season']
                 base /= temp_metadata['episode'] / temp_metadata['shot']
                 dest_path = base / category / filename
                 
@@ -695,15 +695,31 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
                 # Use same mapping logic as repathing for consistency
                 filename = Path(orig_eval).name
                 category = ELEMENTS_REL  # Use standard elements category
-                base = Path(archive_root) / temp_metadata['vendor'] / temp_metadata['show']
-                if temp_metadata.get('season'): base /= temp_metadata['season']
-                base /= temp_metadata['episode'] / temp_metadata['shot']
-                dest_path = base / category / filename
+                
+                # Convert all path components to strings and join them properly
+                archive_root_str = str(archive_root)
+                vendor_str = str(temp_metadata['vendor'])
+                show_str = str(temp_metadata['show'])
+                
+                # Build the base path step by step using Path objects
+                base_path = Path(archive_root_str) / vendor_str / show_str
+                
+                # Add episode and shot
+                base_path = base_path / str(temp_metadata['episode']) / str(temp_metadata['shot'])
+                
+                # Add category and filename
+                dest_path = base_path / category / filename
+                
+                # Convert final path to string with forward slashes
+                dest_path_str = str(dest_path).replace("\\", "/")
                 
                 # Store with normalized paths
-                dependencies_to_copy[orig_eval] = str(dest_path).replace("\\","/")
+                dependencies_to_copy[orig_eval] = dest_path_str
+                _log_print("debug", f"Mapped dependency: {orig_eval} -> {dest_path_str}")
             except Exception as map_e:
                 _log_print("error", f"Could not calculate destination for copying '{orig_eval}': {map_e}")
+                # Log the full exception details for debugging
+                _log_print("debug", f"Exception details: {traceback.format_exc()}")
     
     return dependencies_to_copy
 
