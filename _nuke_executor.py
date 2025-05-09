@@ -26,6 +26,7 @@ from pathlib import Path # Use pathlib for path manipulation within Nuke
 from typing import Dict, List, Set, Optional, Tuple, Any # Use standard typing
 import tempfile
 import logging
+import re # Added for regex matching
 
 # Set up logging to stderr for the wrapper to capture
 logging.basicConfig(level=logging.DEBUG,
@@ -67,8 +68,12 @@ READ_NODE_CLASSES = frozenset([
     "GenerateLUT", "BlinkScript", "ParticleCache", "PointCloudGenerator", "STMap",
 ])
 # Placeholder for category, mirroring simplified mapping logic below
-ELEMENTS_REL = "elements"
+ELEMENTS_REL = 'elements'
 
+# Constants for relative paths
+PROJECT_REL = 'project'
+SCRIPTS_REL = 'scripts'
+NUKE_REL = 'nuke'
 
 # --- Helper Functions (Internal to this script) ---
 
@@ -682,45 +687,112 @@ def save_pruned_script(nodes: Set[nuke.Node], final_script_path: str, archive_ro
 def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_root: str, metadata_json: str) -> Dict[str, str]:
     """
     Generates the final dependency map for copying files.
-    Returns the mapping from original paths to archive paths.
+    Constructs archive paths preserving relative structure after the shot folder.
     """
     dependencies_to_copy = {}
     _log_print("debug", "Generating final dependency map for copying...")
     temp_metadata = json.loads(metadata_json)
-    
+    # Construct the expected shot code pattern (e.g., BOB_101_00X_010_WIG)
+    # Use metadata which should be reliable
+    shot_code_parts = [
+        temp_metadata.get('episode'),
+        temp_metadata.get('sequence'),
+        temp_metadata.get('shot'),
+        temp_metadata.get('tag') # Assuming 'tag' is part of the shot code dir name
+    ]
+    if not all(shot_code_parts[:3]): # Episode, Sequence, Shot are essential
+        _log_print("error", "Cannot construct shot code: Missing episode, sequence, or shot in metadata.")
+        return {}
+        
+    # Filter out None or empty parts before joining
+    shot_code = '_'.join(filter(None, shot_code_parts)) 
+    _log_print("debug", f"Constructed shot code for path splitting: {shot_code}")
+
+    # Regex for the Comp/work/user/images pattern
+    comp_work_images_re = re.compile(r"Comp/work/[^/]+/images/(.*)", re.IGNORECASE)
+
+    # Base archive path construction (common part)
+    try:
+        archive_root_str = str(archive_root)
+        vendor_str = str(temp_metadata['vendor'])
+        show_str = str(temp_metadata['show'])
+        episode_str = str(temp_metadata['episode'])
+        shot_str = str(temp_metadata['shot']) # Using the short shot number here
+        
+        # Build the base path using Path objects (VENDOR/SHOW/EPISODE/SHOT)
+        base_archive_path = Path(archive_root_str) / vendor_str / show_str / episode_str / shot_str / ELEMENTS_REL
+    except KeyError as ke:
+         _log_print("error", f"Cannot build base archive path: Missing metadata key '{ke}'. Metadata: {temp_metadata}")
+         return {}
+    except Exception as base_path_e:
+         _log_print("error", f"Error building base archive path: {base_path_e}")
+         return {}
+         
+    _log_print("debug", f"Base archive path for elements: {base_archive_path}")
+
     for node_knob, data in dependency_info.items():
-        orig_eval = data.get("evaluated_path")
-        if orig_eval and not data.get("error"):  # Only map valid paths
+        original_path = data.get("original_path")
+        if not original_path or data.get("error"):
+            _log_print("debug", f"Skipping mapping for {node_knob}: No original path or error encountered.")
+            continue
+
+        try:
+            # Normalize the original path first
+            normalized_original_path = original_path.replace("\\\\", "/")
+            original_path_obj = Path(normalized_original_path)
+
+            # Find the relative path after the shot_code directory
+            path_parts = normalized_original_path.split('/')
+            relative_elements_path_str = None
+
             try:
-                # Use same mapping logic as repathing for consistency
-                filename = Path(orig_eval).name
-                category = ELEMENTS_REL  # Use standard elements category
-                
-                # Convert all path components to strings and join them properly
-                archive_root_str = str(archive_root)
-                vendor_str = str(temp_metadata['vendor'])
-                show_str = str(temp_metadata['show'])
-                
-                # Build the base path step by step using Path objects
-                base_path = Path(archive_root_str) / vendor_str / show_str
-                
-                # Add episode and shot
-                base_path = base_path / str(temp_metadata['episode']) / str(temp_metadata['shot'])
-                
-                # Add category and filename
-                dest_path = base_path / category / filename
-                
-                # Convert final path to string with forward slashes
-                dest_path_str = str(dest_path).replace("\\", "/")
-                
-                # Store with normalized paths
-                dependencies_to_copy[orig_eval] = dest_path_str
-                _log_print("debug", f"Mapped dependency: {orig_eval} -> {dest_path_str}")
-            except Exception as map_e:
-                _log_print("error", f"Could not calculate destination for copying '{orig_eval}': {map_e}")
-                # Log the full exception details for debugging
-                _log_print("debug", f"Exception details: {traceback.format_exc()}")
-    
+                 # Find the index of the directory matching the constructed shot_code
+                 shot_code_index = -1
+                 for i, part in enumerate(path_parts):
+                     if part == shot_code:
+                          shot_code_index = i
+                          break
+                          
+                 if shot_code_index != -1 and shot_code_index < len(path_parts) - 1:
+                     # Join the parts *after* the shot_code directory
+                     relative_elements_path_str = "/".join(path_parts[shot_code_index + 1:])
+                 else:
+                      # Fallback: Use the full filename if shot_code not found or is the last element
+                      _log_print("warning", f"Shot code '{shot_code}' not found correctly in path '{normalized_original_path}'. Falling back to filename only.")
+                      relative_elements_path_str = original_path_obj.name
+                      
+            except ValueError:
+                 _log_print("warning", f"Could not split path based on shot code '{shot_code}' for: {normalized_original_path}. Falling back to filename.")
+                 relative_elements_path_str = original_path_obj.name
+
+
+            if not relative_elements_path_str:
+                 _log_print("warning", f"Could not determine relative element path for: {normalized_original_path}")
+                 continue
+
+            # Apply the Comp/work/images rule
+            comp_match = comp_work_images_re.match(relative_elements_path_str)
+            if comp_match:
+                _log_print("debug", f"Applying Comp/work/images rule to: {relative_elements_path_str}")
+                relative_elements_path_str = comp_match.group(1) # Get the part after images/
+                _log_print("debug", f"Resulting relative path after rule: {relative_elements_path_str}")
+
+
+            # Construct the final destination path
+            # Ensure the relative part doesn't start with / if base_archive_path handled it
+            final_relative_part = relative_elements_path_str.lstrip('/') 
+            dest_path = base_archive_path / final_relative_part
+
+            # Convert final path to string with forward slashes
+            dest_path_str = str(dest_path).replace("\\\\", "/")
+
+            dependencies_to_copy[normalized_original_path] = dest_path_str
+            _log_print("debug", f"Mapped dependency: {normalized_original_path} -> {dest_path_str}")
+
+        except Exception as map_e:
+            _log_print("error", f"Could not calculate destination for copying '{normalized_original_path}': {map_e}")
+            _log_print("debug", f"Exception details: {traceback.format_exc()}")
+
     return dependencies_to_copy
 
 def run_nuke_tasks(args: argparse.Namespace) -> Dict[str, Any]:
@@ -857,19 +929,32 @@ if __name__ == "__main__":
     finally:
         # --- Output final JSON results to stdout ---
         _log_print("info", "--- NUKE EXECUTOR FINAL RESULTS ---")
+
+        # display nodes_kept count for brevity
+        if "nodes_kept" in final_results:
+            final_results["nodes_kept"] = len(final_results["nodes_kept"])
+
         try:
-            # Use compact JSON output to stdout
-            json_output = json.dumps(final_results, separators=(',', ':'))
+            # Pretty print with indent
+            json_output = json.dumps(final_results, indent=4)
             print(json_output)
         except TypeError as json_e:
-            # Fallback if results contain non-serializable data
+            # Fallback if results (already without nodes_kept) contain other non-serializable data
             _log_print("error", f"Error serializing final results: {json_e}")
+
+            current_errors = final_results.get("errors", [])
+            if not isinstance(current_errors, list): # Ensure errors is a list
+                current_errors = [str(current_errors)]
+
+            fallback_errors_list = current_errors + [f"Serialization error: {json_e}"]
+
             fallback_results = {
                  "status": "failure",
-                 "errors": final_results.get("errors", []) + [f"Serialization error: {json_e}"],
+                 "errors": fallback_errors_list,
                  "serialization_fallback": True
             }
-            print(json.dumps(fallback_results, separators=(',', ':')))
+            # Also pretty print fallback
+            print(json.dumps(fallback_results, indent=4))
 
         _log_print("info", f"--- NUKE EXECUTOR SCRIPT END (Exit Code: {exit_code}) ---")
         # Nuke automatically exits after -t script finishes, but set code explicitly

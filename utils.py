@@ -6,61 +6,28 @@ import logging
 import os
 import re
 import shutil
-import stat
 import subprocess
-import sys
 import time
-import traceback
-import tempfile
-import platform
-import select
-import datetime
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any, Union, Set, Callable
-
-from fixarc import log
-from fixarc import constants
-from fixarc.exceptions import (
-    DependencyError, ConfigurationError, ArchiveError, ParsingError, PruningError,
-    RepathingError, GizmoError, NukeExecutionError, ArchiverError
-)
+from typing import List, Tuple, Optional, Dict, Any, Union
 
 # --- Fixenv Integration ---
 # fixenv is a hard dependency
 import fixenv
-from fixfx.data.studio_data import StudioData
-log.debug("Using fixenv for path handling and OS detection.")
-
 # --- YAML Loading --- (Required dependency)
 import yaml
-log.debug("Using PyYAML for configuration files.")
+from fixarc import constants
+from fixarc import log
+from fixarc.exceptions import (
+    DependencyError, ConfigurationError, ArchiveError, ParsingError, NukeExecutionError, ArchiverError
+)
+from fixfx.data.studio_data import StudioData
+
 
 # --- Path Manipulation & Validation ---
-def normalize_path(path: Union[str, Path]) -> str:
-    """Normalize path using fixenv's function.
-    
-    Args:
-        path: Path to normalize
-        
-    Returns:
-        Normalized path with forward slashes
-    """
-    return fixenv.normalize_path(path)
-
-def sanitize_path(path: Union[str, Path]) -> str:
-    """Sanitize path using fixenv's function.
-    
-    Args:
-        path: Path to sanitize
-        
-    Returns:
-        Sanitized absolute path
-    """
-    return fixenv.sanitize_path(path)
-
 def validate_path_exists(path: str, context: str = "Dependency") -> None:
     """Checks if a file or sequence directory exists. Raises DependencyError if not."""
-    abs_path_str = sanitize_path(path) # Get absolute path first
+    abs_path_str = fixenv.sanitize_path(path) # Get absolute path first
     abs_path_obj = Path(abs_path_str)
     is_seq = get_frame_padding_pattern(abs_path_str) is not None
     target_to_check = abs_path_obj.parent if is_seq else abs_path_obj
@@ -101,7 +68,7 @@ def ensure_ltfs_safe(path_component: str) -> bool:
 
 # --- Sequence Detection --- (Mostly unchanged, ensure normalize_path is used)
 def get_frame_padding_pattern(path: Union[str, Path]) -> Optional[str]:
-    path_str = normalize_path(path) # Use normalized
+    path_str = fixenv.normalize_path(path) # Use normalized
     percent_match = re.search(r"(%0*(\d*)d)", path_str)
     if percent_match: return percent_match.group(1)
     if "####" in path_str: return "####"
@@ -114,12 +81,12 @@ def is_sequence(path: Union[str, Path]) -> bool:
 
 def expand_sequence_path(path_pattern: Union[str, Path], frame_range: Tuple[int, int]) -> List[str]:
     pattern_token = get_frame_padding_pattern(path_pattern)
-    if not pattern_token: return [normalize_path(path_pattern)]
+    if not pattern_token: return [fixenv.normalize_path(path_pattern)]
     paths = []
     try:
         start, end = frame_range
         if end < start: end = start # Clamp range
-        path_str = normalize_path(path_pattern)
+        path_str = fixenv.normalize_path(path_pattern)
         padding = 4; num_format = "{frame:04d}" # Defaults
         if pattern_token.startswith('%'):
             match = re.match(r"%0*(\d*)d", pattern_token); padding = int(match.group(1)) if match and match.group(1) else 4; num_format = f"{{frame:0{padding}d}}"; base_path = path_str.replace(pattern_token, num_format, 1)
@@ -134,7 +101,7 @@ def find_sequence_range_on_disk(path_pattern: Union[str, Path]) -> Optional[Tupl
     pattern_token = get_frame_padding_pattern(path_pattern)
     if not pattern_token: return None
     try:
-        norm_pattern = normalize_path(path_pattern); base_dir = Path(norm_pattern).parent
+        norm_pattern = fixenv.normalize_path(path_pattern); base_dir = Path(norm_pattern).parent
         if not base_dir.is_dir(): return None
         filename_pattern_part = Path(norm_pattern).name; parts = filename_pattern_part.split(pattern_token, 1); file_prefix = parts[0]; file_suffix = parts[1] if len(parts) > 1 else ""
         padding = 4 # Default
@@ -178,7 +145,7 @@ def get_nuke_executable() -> str:
 
     if Path(default_path).is_file():
         log.debug(f"Using default Nuke executable for {fixenv.OS}: {default_path}")
-        return normalize_path(default_path)
+        return fixenv.normalize_path(default_path)
 
     # If default not found, raise error
     raise ConfigurationError(f"Nuke executable not found at default location: '{default_path}'.")
@@ -235,9 +202,9 @@ def execute_nuke_archive_process(
         nuke_exe,
         "-t", # Terminal mode
         str(constants.NUKE_EXECUTOR_SCRIPT_PATH),
-        "--input-script-path", normalize_path(input_script_path),
-        "--archive-root", normalize_path(archive_root), # Pass for context
-        "--final-script-archive-path", normalize_path(final_script_archive_path),
+        "--input-script-path", fixenv.normalize_path(input_script_path),
+        "--archive-root", fixenv.normalize_path(archive_root), # Pass for context
+        "--final-script-archive-path", fixenv.normalize_path(final_script_archive_path),
         "--metadata-json", metadata_json_string, # Pass for context
     ]
     if bake_gizmos: command.append("--bake-gizmos")
@@ -371,8 +338,8 @@ def copy_file_or_sequence(source: str, dest: str, frame_range: Optional[Tuple[in
         List of (source, dest) pairs that were successfully planned or copied.
     """
     copied_pairs = []
-    norm_source = normalize_path(source)
-    norm_dest = normalize_path(dest)
+    norm_source = fixenv.normalize_path(source)
+    norm_dest = fixenv.normalize_path(dest)
 
     try:
         if is_sequence(norm_source):
@@ -490,8 +457,8 @@ def copy_files_robustly(
             failure_count += 1
             continue
 
-        norm_source = normalize_path(source_path)
-        norm_dest = normalize_path(dest_path)
+        norm_source = fixenv.normalize_path(source_path)
+        norm_dest = fixenv.normalize_path(dest_path)
 
         # Check for sequence pattern
         is_seq = is_sequence(norm_source)
@@ -657,11 +624,6 @@ def _debug_studio_data_object(studio_data: Any) -> None:
     else:
         log.debug("No accessible attributes found")
     
-    # Check for common expected patterns
-    path_pattern = getattr(studio_data, 'path_pattern', None)
-    if path_pattern:
-        log.debug(f"Path pattern: {path_pattern}")
-    
     # Output object type for debugging
     log.debug(f"Object type: {type(studio_data).__name__}")
     log.debug("--- End StudioData Debug Info ---")
@@ -786,8 +748,8 @@ def get_default_archive_path(source_path: str, archive_root: str) -> str:
     Raises:
         ValueError: If paths are invalid or cannot be processed.
     """
-    norm_source = normalize_path(source_path)
-    norm_root = normalize_path(archive_root)
+    norm_source = fixenv.normalize_path(source_path)
+    norm_root = fixenv.normalize_path(archive_root)
 
     if not Path(norm_root).is_absolute():
         raise ValueError(f"Archive root must be an absolute path: {archive_root}")
@@ -820,6 +782,6 @@ def get_default_archive_path(source_path: str, archive_root: str) -> str:
 
     # Combine archive root and the modified relative part
     # Use os.path.join and then normalize again to handle separators correctly
-    final_path = normalize_path(os.path.join(norm_root, relative_part))
+    final_path = fixenv.normalize_path(os.path.join(norm_root, relative_part))
     log.debug(f"Default mapping: '{source_path}' -> '{final_path}'")
     return final_path

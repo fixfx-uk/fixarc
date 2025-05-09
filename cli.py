@@ -19,17 +19,16 @@ import logging # Import standard logging for setup
 import time
 
 from typing import Dict, Any, Optional, List
+from fixenv import normalize_path
 # Use package-level logger and __version__
 from . import log, __version__
 from . import constants  # Import constants module to access DEFAULT_VENDOR_NAME
 from .archive_utils import get_archive_script_path # Specific utility for script path
 from .utils import (
-    get_metadata_from_path, normalize_path, parse_frame_range,
-    execute_nuke_archive_process, copy_files_robustly
+    get_metadata_from_path, execute_nuke_archive_process, copy_files_robustly
 )
 from .exceptions import (
-    ArchiveError, ConfigurationError, DependencyError,
-    NukeExecutionError, ParsingError, RepathingError, GizmoError, PruningError, ArchiverError
+    ConfigurationError, DependencyError, NukeExecutionError, ParsingError, RepathingError, GizmoError, PruningError, ArchiverError
 )
 
 
@@ -190,11 +189,14 @@ def _prepare_and_validate_metadata(args: argparse.Namespace, script_path: str) -
             if sh_tag: inferred_shot += f"_{sh_tag}"
             log.info(f"Constructed shot name from inferred parts: {inferred_shot}")
 
-    # Merge CLI args over inferred data
+    # Build metadata including sequence and tag for full context in Nuke executor
     metadata = {
         "vendor": args.vendor or constants.DEFAULT_VENDOR_NAME,
-        "show": args.show or inferred.get("project") or inferred.get("show"), # Map inferred 'project' to 'show'
+        "show": args.show or inferred.get("project") or inferred.get("show"),  # Map inferred 'project' to 'show'
         "episode": args.episode or inferred.get("episode"),
+        # Include sequence and tag from inferred StudioData for dependency mapping
+        "sequence": inferred.get("sequence"),
+        "tag": inferred.get("tag"),
         "shot": args.shot or inferred_shot,
     }
     
@@ -207,7 +209,7 @@ def _prepare_and_validate_metadata(args: argparse.Namespace, script_path: str) -
             log.debug(f"Using inferred value for '{key}': {value}")
 
     # Validate required fields for SPT structure
-    required_keys = ["vendor", "show", "episode", "shot"] # Episode needed for structure
+    required_keys = ["vendor", "show", "episode", "shot"]  # sequence and tag are optional for CLI
     missing = [k for k in required_keys if not metadata.get(k)]
     
     if missing:

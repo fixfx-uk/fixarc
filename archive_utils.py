@@ -5,11 +5,10 @@ Utilities specifically for determining archive paths based on SPT structure and 
 from pathlib import Path
 # Make sure all necessary types are imported from typing
 from typing import Dict, Any, Optional, Tuple # Added Tuple just in case, ensure Dict is here
-import os
-import re
 
+from fixenv import normalize_path
 from . import constants, log
-from .utils import normalize_path, ensure_ltfs_safe # Use general utils for path safety
+from .utils import ensure_ltfs_safe # Use general utils for path safety
 from .exceptions import ConfigurationError, ArchiverError
 
 def _get_spt_directory(

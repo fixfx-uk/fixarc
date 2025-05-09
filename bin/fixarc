@@ -11,15 +11,16 @@ import os
 import runpy
 import platform
 import subprocess
-from pathlib import Path
 
 def main():
     """Modify sys.path and use runpy to run the fixarc CLI module."""
     try:
         # Get the directory where this script (fixarc) is located
         script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Get bin dir
+        bin_dir =  os.path.dirname(script_dir)
         # Get the project root directory (one level up)
-        project_root = os.path.dirname(script_dir)
+        project_root = os.path.dirname(bin_dir)
         
         # We need to set up paths first to import fixfx.log
         if project_root not in sys.path:
@@ -29,6 +30,15 @@ def main():
         fixenv_root = os.path.abspath(os.path.join(project_root, '..', 'fixenv'))
         if os.path.exists(fixenv_root) and fixenv_root not in sys.path:
             sys.path.insert(0, fixenv_root)
+            
+        # --- Attempt to import fixenv early ---
+        # This makes 'fixenv' a local variable for the main() function's scope.
+        # If this import fails, 'fixenv' will be set to None.
+        # If it succeeds, 'fixenv' is the module.
+        try:
+            import fixenv
+        except ImportError as e:
+            fixenv = None # Crucial: define 'fixenv' if import fails
             
         # Import fixfx.log for logging
         try:
@@ -47,7 +57,7 @@ def main():
         # --- Bootstrap fixenv environment ---
         try:
             # Check for config file existence before running fixe
-            config_path = os.path.join(os.environ.get('FIXSTORE_DRIVE', 'Z:'), 'pipe', '.config', 'env', 'studio_config.json')
+            config_path = fixenv.CONFIG_PATH
             log.info(f"Looking for studio config at: {config_path}")
             if os.path.exists(config_path):
                 log.info(f"Found studio_config.json, checking content...")
@@ -73,9 +83,6 @@ def main():
                 if platform.system() == 'Windows':
                     # On Windows, we might need a shell to eval the exports or run Python directly
                     try:
-                        import fixenv
-                        log.info(f"Imported fixenv directly")
-                        
                         # Check fixenv attributes
                         log.debug(f"fixenv.__file__: {fixenv.__file__}")
                         
