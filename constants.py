@@ -1,101 +1,104 @@
-"""Constants used by the Fix Archive tool."""
-import os # Use os for path joining
+# fixarc/constants.py
+"""Constants used by the Fix Archive (fixarc) tool."""
+import os
+from typing import Dict, List, FrozenSet, Callable, Any
+from pathlib import Path
 
-# --- Nuke Executable Paths ---
-from fixenv import (
-    NUKE_EXEC_PATH_WIN,
-    NUKE_EXEC_PATH_LIN,
-    NUKE_EXEC_PATH_MAC,
-)
+# Import fixenv directly
+import fixenv
+
+# Use studio short name from fixenv
+DEFAULT_VENDOR_NAME = getattr(fixenv.constants, 'STUDIO_SHORT_NAME', 'FixFX')
 
 # --- SPT v3.2.0 Folder Names (Placeholders for format()) ---
 # These should match the spec exactly. Use braces {} for placeholders.
-VENDOR_DIR = "{vendor}"
-SHOW_DIR = "{show}"
-SEASON_DIR = "{season}" # Optional, only added if season metadata exists and is non-empty
-EPISODE_DIR = "{episode}"
-SHOT_DIR = "{shot}"
+VENDOR_DIR: str = "{vendor}"
+SHOW_DIR: str = "{show}"
+EPISODE_DIR: str = "{episode}"
+SHOT_DIR: str = "{shot}"
 
-# Relative paths within the SHOT_DIR, using os.path.join and normalizing slashes
-# Ensures correct separator regardless of OS where script runs, then forces forward slash.
-def _spt_rel_path(*args):
-    """Helper to join path components and ensure forward slashes."""
+# --- Relative Archive Paths within SHOT_DIR ---
+def _rel_path(*args: str) -> str:
+    """Helper to join path components and ensure forward slashes.
+    
+    Args:
+        *args: Path components to join
+        
+    Returns:
+        Joined path with forward slashes
+    """
     return os.path.join(*args).replace("\\", "/")
 
-PROJECT_FILES_REL = _spt_rel_path("project", "nuke")
-ELEMENTS_REL = "elements" # Root elements folder
-PRERENDERS_REL = "prerenders"
-ROTO_REL = "roto" # As per spec, sometimes under elements, sometimes separate? Assuming separate for now.
-TRACKS_REL = "tracks"
-CLEANPLATES_REL = _spt_rel_path(ELEMENTS_REL, "cleanplates") # Subfolder under elements
-MATTES_REL = _spt_rel_path(ELEMENTS_REL, "mattes") # Subfolder under elements
-REFERENCE_REL = "reference" # General reference folder
-LUT_REL = _spt_rel_path(REFERENCE_REL, "lut") # Example LUT location under reference
+PROJECT_FILES_REL: str = _rel_path("project", "nuke")
+ELEMENTS_REL: str = "elements" # Root elements folder
+PRERENDERS_REL: str = "prerenders"
+ROTO_REL: str = "roto"
+TRACKS_REL: str = "tracks"
+CLEANPLATES_REL: str = _rel_path(ELEMENTS_REL, "cleanplates") # Subfolder under elements
+MATTES_REL: str = _rel_path(ELEMENTS_REL, "mattes") # Subfolder under elements
+REFERENCE_REL: str = "reference"
+LUT_REL: str = _rel_path(REFERENCE_REL, "lut")
+GEO_CACHE_REL: str = _rel_path(ELEMENTS_REL, "geo_cache") # Example for geo/alembic
+CAMERA_REL: str = _rel_path(TRACKS_REL, "camera")      # Example for cameras
 
 # --- Nuke Node Classes ---
 # Classes typically containing file paths for *reading* dependencies
-# List should be comprehensive based on common usage.
-READ_NODE_CLASSES = [
+READ_NODE_CLASSES: FrozenSet[str] = frozenset([
     "Read",
-    "ReadGeo", "ReadGeo2", # Include older geo reader
+    "ReadGeo", "ReadGeo2",
     "DeepRead",
-    "Camera", "Camera2", "Camera3", # Camera nodes often load Alembic/FBX
-    "Axis", "Axis2", "Axis3", # Axis nodes can also load geometry
-    "OCIOFileTransform", # Reads LUTs (.csp, .cub, etc.)
-    "Vectorfield", # Reads .vf files
-    "GenerateLUT", # Often reads source LUTs (.cube, .spi1d, etc.) for baking
-    "BlinkScript", # Can define file knobs
-    "ParticleCache", # Reads particle caches
-    "PointCloudGenerator", # Might read geo
-    # Add specific plugins/gizmos known to read files if needed
-    # "STMap", # Reads UV maps
-    # "PlanarTracker", # Might save/load tracking data? Check knobs.
-]
+    "Camera", "Camera2", "Camera3",
+    "Axis", "Axis2", "Axis3",
+    "OCIOFileTransform",
+    "Vectorfield",
+    "GenerateLUT",
+    "BlinkScript", # Check file knobs specifically
+    "ParticleCache",
+    "PointCloudGenerator",
+    "STMap",
+    # Add more as needed
+])
 
 # Classes considered as final output nodes for pruning trace
-# This list determines the starting points for dependency tracing.
-WRITE_NODE_CLASSES = [
+WRITE_NODE_CLASSES: FrozenSet[str] = frozenset([
     "Write",
-    "WriteGeo", # For geometry output
-    "DeepWrite", # For deep data output
-    # Custom Write nodes like WriteFix are handled separately by `is_valid_writefix`
-]
+    "WriteGeo",
+    "DeepWrite",
+    # WriteFix handled specially
+])
 
 # --- LTFS / Path Safety ---
 # Characters generally considered unsafe for LTFS or simple cross-platform paths.
-# Includes: <>:"/\|?* and whitespace (\s)
-# Adjusted to be slightly less strict on spaces if needed, but SPT spec might disallow them.
-# Sticking to stricter pattern for now. Use raw string r'...'
-INVALID_FILENAME_CHARS = r'[<>:"/\\|?*\s]'
+INVALID_FILENAME_CHARS: str = r'[<>:"/\\|?*\s]' # Raw string
+
+# --- Internal Script Name ---
+NUKE_EXECUTOR_SCRIPT_NAME: str = "_nuke_executor.py"
+
+# Path to the internal Nuke script (derived from this file's location)
+NUKE_EXECUTOR_SCRIPT_PATH: Path = Path(__file__).parent / NUKE_EXECUTOR_SCRIPT_NAME
 
 __all__ = [
-    # Nuke Executables
-    'NUKE_EXEC_PATH_WIN',
-    'NUKE_EXEC_PATH_LIN',
-    'NUKE_EXEC_PATH_MAC',
+    # OS Detection (via fixenv)
+    'fixenv',
     
+    # Default Vendor Name
+    'DEFAULT_VENDOR_NAME',
+
     # SPT Folder Names
-    'VENDOR_DIR',
-    'SHOW_DIR',
-    'SEASON_DIR',
-    'EPISODE_DIR',
-    'SHOT_DIR',
-    
+    'VENDOR_DIR', 'SHOW_DIR', 'EPISODE_DIR', 'SHOT_DIR',
+
     # Relative Paths
-    'PROJECT_FILES_REL',
-    'ELEMENTS_REL',
-    'PRERENDERS_REL',
-    'ROTO_REL',
-    'TRACKS_REL',
-    'CLEANPLATES_REL',
-    'MATTES_REL',
-    'REFERENCE_REL',
-    'LUT_REL',
-    
+    'PROJECT_FILES_REL', 'ELEMENTS_REL', 'PRERENDERS_REL', 'ROTO_REL',
+    'TRACKS_REL', 'CLEANPLATES_REL', 'MATTES_REL', 'REFERENCE_REL', 'LUT_REL',
+    'GEO_CACHE_REL', 'CAMERA_REL',
+
     # Node Classes
-    'READ_NODE_CLASSES',
-    'WRITE_NODE_CLASSES',
-    
+    'READ_NODE_CLASSES', 'WRITE_NODE_CLASSES',
+
     # Path Safety
     'INVALID_FILENAME_CHARS',
+
+    # Internal Script
+    'NUKE_EXECUTOR_SCRIPT_NAME',
+    'NUKE_EXECUTOR_SCRIPT_PATH',
 ]
