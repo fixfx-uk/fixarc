@@ -65,7 +65,7 @@ def _get_spt_directory(
         shot = sanitize_for_path(metadata['shot'], 'shot')
 
         # --- Construct Base Path (Vendor/Show/Episode/Shot) ---
-        base = Path(normalize_path(archive_root)) / \
+        base = Path(archive_root) / \
                constants.VENDOR_DIR.format(vendor=vendor) / \
                constants.SHOW_DIR.format(show=show) / \
                constants.EPISODE_DIR.format(episode=episode) / \
@@ -74,6 +74,7 @@ def _get_spt_directory(
         # --- Add Relative Category Path (if provided) ---
         full_dir_path = base
         if relative_category_path:
+            # Assume relative_category_path might not be normalized yet
             clean_relative_path = normalize_path(relative_category_path).strip('/')
             if '..' in clean_relative_path.split('/'):
                  raise ValueError(f"Relative category path '{relative_category_path}' contains '..', potentially unsafe.")

@@ -80,13 +80,21 @@ def is_sequence(path: Union[str, Path]) -> bool:
     return get_frame_padding_pattern(path) is not None
 
 def expand_sequence_path(path_pattern: Union[str, Path], frame_range: Tuple[int, int]) -> List[str]:
-    pattern_token = get_frame_padding_pattern(path_pattern)
-    if not pattern_token: return [fixenv.normalize_path(path_pattern)]
+    # Convert to string and normalize once at the beginning
+    if isinstance(path_pattern, Path):
+        path_pattern_str = str(path_pattern)
+    else:
+        path_pattern_str = path_pattern
+    normalized_path_pattern = fixenv.normalize_path(path_pattern_str)
+
+    pattern_token = get_frame_padding_pattern(normalized_path_pattern) # Pass the normalized string
+    if not pattern_token: return [normalized_path_pattern] # Use the already normalized path
     paths = []
     try:
         start, end = frame_range
         if end < start: end = start # Clamp range
-        path_str = fixenv.normalize_path(path_pattern)
+        # path_str = fixenv.normalize_path(path_pattern) # Remove this redundant normalization
+        path_str = normalized_path_pattern # Use the already normalized path
         padding = 4; num_format = "{frame:04d}" # Defaults
         if pattern_token.startswith('%'):
             match = re.match(r"%0*(\d*)d", pattern_token); padding = int(match.group(1)) if match and match.group(1) else 4; num_format = f"{{frame:0{padding}d}}"; base_path = path_str.replace(pattern_token, num_format, 1)
@@ -98,12 +106,20 @@ def expand_sequence_path(path_pattern: Union[str, Path], frame_range: Tuple[int,
     return paths
 
 def find_sequence_range_on_disk(path_pattern: Union[str, Path]) -> Optional[Tuple[int, int]]:
-    pattern_token = get_frame_padding_pattern(path_pattern)
+    # Convert to string and normalize once at the beginning
+    if isinstance(path_pattern, Path):
+        path_pattern_str = str(path_pattern)
+    else:
+        path_pattern_str = path_pattern
+    normalized_path_pattern = fixenv.normalize_path(path_pattern_str)
+
+    pattern_token = get_frame_padding_pattern(normalized_path_pattern) # Pass the normalized string
     if not pattern_token: return None
     try:
-        norm_pattern = fixenv.normalize_path(path_pattern); base_dir = Path(norm_pattern).parent
+        # norm_pattern = fixenv.normalize_path(path_pattern); base_dir = Path(norm_pattern).parent # Remove redundant normalization
+        base_dir = Path(normalized_path_pattern).parent # Use the already normalized path
         if not base_dir.is_dir(): return None
-        filename_pattern_part = Path(norm_pattern).name; parts = filename_pattern_part.split(pattern_token, 1); file_prefix = parts[0]; file_suffix = parts[1] if len(parts) > 1 else ""
+        filename_pattern_part = Path(normalized_path_pattern).name; parts = filename_pattern_part.split(pattern_token, 1); file_prefix = parts[0]; file_suffix = parts[1] if len(parts) > 1 else ""
         padding = 4 # Default
         if pattern_token.startswith('%'): match = re.match(r"%0*(\d*)d", pattern_token); padding = int(match.group(1)) if match and match.group(1) else 4
         elif pattern_token == "####": padding = 4

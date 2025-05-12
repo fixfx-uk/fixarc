@@ -14,6 +14,7 @@ import subprocess
 
 def main():
     """Modify sys.path and use runpy to run the fixarc CLI module."""
+    target_module = "fixarc.cli" # Use fully qualified module name with package prefix
     try:
         # Get the directory where this script (fixarc) is located
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -145,7 +146,6 @@ def main():
             except Exception as e:
                 log.error(f"Manual NUKE_PATH setup failed: {e}")
         
-        target_module = "fixarc.cli" # Use fully qualified module name with package prefix
         log.info(f"Attempting to run module '{target_module}'")
         log.debug(f"sys.path: {sys.path}")
 
