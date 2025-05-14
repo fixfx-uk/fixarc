@@ -48,6 +48,7 @@ def get_projects(base_path):
     except OSError as e:
         log.error(f"Error listing projects in {base_path}: {e}")
         return []
+
 def get_episodes(base_path, project_name):
     """Lists episode directories under <base_path>/<project_name>/shots/."""
     if not all([base_path, project_name]):

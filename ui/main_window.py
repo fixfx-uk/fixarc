@@ -17,9 +17,11 @@ try:
     from fixenv.core import normalize_path
     DEFAULT_VENDOR = fixenv.constants.STUDIO_SHORT_NAME
     DEFAULT_BASE_PATH_FUNC = lambda: normalize_path(fixenv.constants.FIXSTORE_DRIVE + '/proj') if hasattr(fixenv.constants, 'FIXSTORE_DRIVE') else None
+    DEFAULT_ARCHIVE_DRIVE = fixenv.constants.FIXARCHIVE_DRIVE if hasattr(fixenv.constants, 'FIXARCHIVE_DRIVE') else "W:" # Default archive drive
 except ImportError:
     DEFAULT_VENDOR = "FixFX" # Hardcoded fallback
     DEFAULT_BASE_PATH_FUNC = 'Z:/proj'
+    DEFAULT_ARCHIVE_DRIVE = "W:" # Hardcoded fallback
 
 
 # Import UI utilities and package logger
@@ -273,6 +275,7 @@ class FixarcHandlerWindow(QtWidgets.QMainWindow):
         self.project_combo.clear()
         self.project_combo.addItem("") # Add empty option first
         if self.current_base_path:
+            print(self.current_base_path)
             try:
                 projects = data_utils.get_projects(self.current_base_path)
                 self.project_combo.addItems(projects)
@@ -350,9 +353,20 @@ class FixarcHandlerWindow(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
 
     def _project_changed(self):
-        log.debug(f"Project changed to: {self.project_combo.currentText()}")
+        selected_project = self.project_combo.currentText()
+        log.debug(f"Project changed to: {selected_project}")
         self._populate_episodes()
         self._populate_shots() # Show all shots initially for the project
+
+        # Set default archive root based on project if the field is empty
+        if selected_project:
+            default_archive_path = f"{DEFAULT_ARCHIVE_DRIVE}/proj/{selected_project}/delivery/archive"
+            if not self.archive_root_input.text(): # Only set if empty
+                self.archive_root_input.setText(normalize_path(default_archive_path))
+                log.debug(f"Set default archive root: {default_archive_path}")
+        else:
+             if not self.archive_root_input.text(): # Clear only if empty (or perhaps based on previous default?)
+                 self.archive_root_input.clear()
 
     def _episode_selection_changed(self):
         selected_episodes = self._get_selected_items(self.episode_list)

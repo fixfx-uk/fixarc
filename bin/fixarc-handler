@@ -1,6 +1,31 @@
 #!/usr/bin/env python
 """
-Python-based handler for archiving Nuke scripts using fixarc.
+Handles batch archiving of Nuke scripts using the 'fixarc' core tool.
+
+This script provides a command-line interface to find Nuke scripts (.nk)
+within a specified project structure based on project, episode, sequence, or
+shot names. It then invokes the 'fixarc' command-line tool for each identified
+script to perform the actual archival process.
+
+Key functionalities include:
+- Discovering Nuke scripts in predefined 'publish/nuke' directories.
+- Filtering scripts by version (latest, all, or top N).
+- Allowing specification of project, episode, sequence, or shot scopes.
+- Optional submission of archiving tasks to a Deadline render farm.
+- Passing through custom options to the underlying 'fixarc' tool.
+- Environment variable (`FIXSTORE_DRIVE`) based default for project base paths.
+
+Example Usages:
+  # Archive latest version of all shots in project 'MYPROJ'
+  fixarc-handler --project MYPROJ --archive-root /mnt/archive
+
+  # Archive latest 3 versions for episode 'EP01' of 'MYPROJ'
+  fixarc-handler --project MYPROJ --episode EP01 --max-versions 3 --archive-root /mnt/archive
+
+  # Archive all versions for specific shots, submit to farm, and pass fixarc options
+  fixarc-handler --project MYPROJ --shot SH0010 SH0020 \\
+    --archive-root /mnt/archive --farm --max-versions 0 \\
+    --fixarc-options "--update-script --vendor MyVendor"
 """
 
 import argparse
@@ -13,23 +38,49 @@ import glob   # For finding Nuke scripts
 import shlex  # For parsing fixarc_options
 import tempfile # For Deadline job file creation
 
+# Initialize logger global. It will be configured below.
 log = None
 
 try:
-    from fixfx import log # Try to import the pre-configured logger
+    # Attempt to use a pre-configured logger from a 'fixfx' package if available.
+    # This allows centralized logging if fixarc-handler is part of a larger toolkit.
+    from fixfx import log
 except ImportError:
-    # Fallback basic logging configuration if 'fixfx.log' is not available
+    # Fallback to a basic logging configuration if 'fixfx.log' is not available.
+    # This ensures that logging is still functional when run standalone.
     logging.basicConfig(
-        level=logging.DEBUG,  # Set root logger to allow DEBUG messages if handler is set to DEBUG
+        level=logging.DEBUG,  # Set root logger to allow DEBUG messages. Handler level is set in main().
         format='%(asctime)s [%(levelname)-7s] [%(name)s]: %(message)s'
     )
-    log = logging.getLogger("fixarc.handler") # Create/get a logger specific to fixarc-handler
+    log = logging.getLogger("fixarc.handler") # Create/get a logger specific to this script.
 
 
 def get_command_path(command_name, is_essential=True, relative_fallback_search_dirs=None):
-    """Finds the absolute path to a command, optionally checking relative paths."""
+    """Finds the absolute path to a command, optionally checking relative paths.
+
+    Searches for the command in the system's PATH. If not found and
+    `relative_fallback_search_dirs` are provided, it checks those directories.
+    On Windows, it also attempts to find executables with common extensions
+    (e.g., .exe, .bat) if the command_name doesn't include one.
+
+    Args:
+        command_name (str): The name of the command to find (e.g., "fixarc", "deadlinecommand").
+        is_essential (bool, optional): If True and the command is not found,
+            the script will log an error and exit. If False, it logs a warning
+            and returns None. Defaults to True.
+        relative_fallback_search_dirs (list[str], optional): A list of directory paths
+            to search if the command is not found in PATH. Paths are typically
+            relative to this script's location. Defaults to None.
+
+    Returns:
+        str | None: The absolute, real path to the command if found, otherwise None
+        (if `is_essential` is False and command is not found).
+
+    Raises:
+        SystemExit: If `is_essential` is True and the command cannot be found.
+    """
     cmd_path = shutil.which(command_name)
-    
+
     if not cmd_path and relative_fallback_search_dirs:
         if not isinstance(relative_fallback_search_dirs, list):
             relative_fallback_search_dirs = [relative_fallback_search_dirs]
@@ -50,30 +101,48 @@ def get_command_path(command_name, is_essential=True, relative_fallback_search_d
                         cmd_path = os.path.realpath(potential_path_ext)
                         log.info(f"Found '{command_name}' (as {os.path.basename(cmd_path)}) via relative path: {cmd_path}")
                         break
-                 if cmd_path:
+                 if cmd_path: # If found with an extension, break the outer loop
                      break
 
-
     if cmd_path:
-        cmd_path = os.path.realpath(cmd_path) # Ensure absolute path
+        cmd_path = os.path.realpath(cmd_path) # Ensure absolute and canonical path
         log.debug(f"Found command '{command_name}' at: {cmd_path}")
         return cmd_path
     else:
         msg = f"Command '{command_name}' not found in PATH or specified fallback locations."
         if is_essential:
             log.error(msg)
-            sys.exit(1)
+            sys.exit(1) # Critical command missing, exit script.
         else:
-            log.warning(msg)
+            log.warning(msg) # Non-critical, allow script to potentially continue.
             return None
 
 def build_search_paths(mode, project_name, names_to_process, base_path):
-    """Builds a list of directories to search for Nuke scripts."""
+    """Builds a list of absolute directory paths to search for Nuke scripts.
+
+    The construction of search paths depends on the operating `mode` and the
+    provided names (episodes, sequences, or shots). It assumes a standard
+    project directory structure:
+    `{base_path}/{project_name}/shots/{episode_name}/{sequence_name}/{shot_name}`.
+
+    Args:
+        mode (str): The operational mode ("project", "episode", "sequence", "shot").
+        project_name (str): The name of the project.
+        names_to_process (list[str]): A list of names (episode, sequence, or shot names)
+            to process. This is empty if `mode` is "project".
+        base_path (str): The absolute base path for all projects (e.g., "/mnt/proj", "W:\\proj").
+
+    Returns:
+        tuple[list[str], list[str]]: A tuple containing two lists:
+            - search_paths: A list of valid, existing absolute directory paths to search.
+            - missing_search_roots: A list of paths that were expected but not found.
+    """
     search_paths = []
     missing_search_roots = []
     log.info(f"Determining search paths (Mode: {mode}, Project: {project_name}, Base: {base_path})")
 
     if mode == "project":
+        # For project mode, search the root 'shots' directory of the project.
         search_root = os.path.join(base_path, project_name, "shots")
         if not os.path.isdir(search_root):
             log.error(f"Project shots directory not found: {search_root}")
@@ -81,12 +150,12 @@ def build_search_paths(mode, project_name, names_to_process, base_path):
         else:
             search_paths.append(search_root)
             log.info(f"Added search path for project '{project_name}': {search_root}")
-    
+
     elif mode == "episode":
         log.info(f"Targeting episodes for project: {project_name}")
         for episode_name in names_to_process:
-            # Assuming episode_name is just the episode identifier like "BOB_101"
-            # and the structure is project/shots/episode_name/
+            # Assumes episode_name is an identifier like "BOB_101"
+            # Structure: {base_path}/{project_name}/shots/{episode_name}/
             search_root = os.path.join(base_path, project_name, "shots", episode_name)
             if not os.path.isdir(search_root):
                 log.warning(f"Episode directory not found: {search_root}. Will not search here.")
@@ -94,21 +163,22 @@ def build_search_paths(mode, project_name, names_to_process, base_path):
             else:
                 search_paths.append(search_root)
                 log.info(f"Added search path for episode '{episode_name}': {search_root}")
-    
+
     elif mode == "sequence":
         log.info(f"Targeting sequences for project: {project_name}")
         for seq_name in names_to_process:
+            # Expects seq_name like "BOB_101_00X"
+            # Tries to infer episode_dir from the first two parts (e.g., "BOB_101")
             parts = seq_name.split('_')
-            # Bash: episode=$(echo "$seq_name" | cut -d'_' -f1,2)
-            # For BOB_101_00X, this gives BOB_101. For BOB_101, it also gives BOB_101.
             if len(parts) >= 2:
                  episode_dir_guess = f"{parts[0]}_{parts[1]}"
-            elif len(parts) == 1: # e.g. sequence 'BOB' might have an episode dir 'BOB'
+            elif len(parts) == 1: # Handles cases like sequence 'MAIN' under episode 'MAIN'
                  episode_dir_guess = parts[0]
-            else: # Should not happen if names_to_process has items
-                log.warning(f"Sequence name '{seq_name}' too short to determine episode path. Skipping.")
+            else: # Should not happen if names_to_process has items and names are valid
+                log.warning(f"Sequence name '{seq_name}' is too short to reliably determine episode path. Skipping.")
                 continue
             
+            # Structure: {base_path}/{project_name}/shots/{episode_dir_guess}/{seq_name}/
             search_root = os.path.join(base_path, project_name, "shots", episode_dir_guess, seq_name)
             if not os.path.isdir(search_root):
                 log.warning(f"Sequence directory not found: {search_root}. Will not search here.")
@@ -120,15 +190,16 @@ def build_search_paths(mode, project_name, names_to_process, base_path):
     elif mode == "shot":
         log.info(f"Targeting shots for project: {project_name}")
         for shot_name in names_to_process:
+            # Expects shot_name format like: EP_EPNUM_SEQNUM_SHOTNUM_TASK (e.g., BOB_101_010_005_CMP)
+            # or at least EP_EPNUM_SEQNUM_SHOTNUM
             parts = shot_name.split('_')
-            # Bash: parts=(${shot_name//_/ }); if [ ${#parts[@]} -lt 4 ]; then ...
-            # Expects: EP_EP_SEQ_SHOT_TAG (e.g. BOB_101_010_005_CMP)
-            if len(parts) < 3: # Minimum for EP_EP_SEQ for sequence_dir
-                log.warning(f"Shot name '{shot_name}' does not seem to match expected format (e.g., EP_EP_SEQ_SHOT_TAG). Skipping.")
+            if len(parts) < 3: # Minimum for EP_EPNUM_SEQNUM for sequence_dir
+                log.warning(f"Shot name '{shot_name}' does not seem to match expected format (e.g., EP_EPNUM_SEQNUM_SHOTNUM_TASK). Cannot reliably determine path. Skipping.")
                 continue
             
-            episode_dir = f"{parts[0]}_{parts[1]}"
-            sequence_dir = f"{parts[0]}_{parts[1]}_{parts[2]}"
+            episode_dir = f"{parts[0]}_{parts[1]}" # e.g., BOB_101
+            sequence_dir = f"{parts[0]}_{parts[1]}_{parts[2]}" # e.g., BOB_101_010
+            # Structure: {base_path}/{project_name}/shots/{episode_dir}/{sequence_dir}/{shot_name}/
             search_root = os.path.join(base_path, project_name, "shots", episode_dir, sequence_dir, shot_name)
             if not os.path.isdir(search_root):
                 log.warning(f"Shot directory not found: {search_root}. Will not search here.")
@@ -140,7 +211,32 @@ def build_search_paths(mode, project_name, names_to_process, base_path):
     return search_paths, missing_search_roots
 
 def find_and_filter_nuke_scripts(search_paths, max_versions):
-    """Finds .nk files, sorts them by version, and filters based on max_versions."""
+    """Finds Nuke scripts, sorts them by name (naively for version), and filters.
+
+    This function walks through the `search_paths` looking for a
+    `publish/nuke` subdirectory. Within these directories, it lists all `.nk`
+    files, sorts them lexicographically (which often corresponds to version sorting
+    if filenames are well-behaved, e.g., `script_v001.nk`, `script_v002.nk`),
+    and then filters them based on the `max_versions` argument.
+
+    Args:
+        search_paths (list[str]): A list of absolute directory paths to search.
+            Typically generated by `build_search_paths`.
+        max_versions (int): The number of latest versions to select.
+            - If `<= 0`, all found versions are selected.
+            - If `1`, only the lexicographically last version is selected.
+            - If `> 1`, the lexicographically last `N` versions are selected.
+
+    Returns:
+        list[str]: A list of absolute paths to the selected Nuke script files.
+                   Returns an empty list if no scripts are found or if `search_paths` is empty.
+    
+    Note:
+        The version sorting is basic (lexicographical). For more robust natural
+        sorting of versions (e.g., 'v2' vs 'v10'), a library like 'natsort'
+        or more complex regex-based version extraction would be needed. This
+        implementation assumes simple, consistent naming.
+    """
     all_found_scripts = []
     if not search_paths:
         log.warning("No search paths provided to find_and_filter_nuke_scripts.")
@@ -149,19 +245,21 @@ def find_and_filter_nuke_scripts(search_paths, max_versions):
     log.info(f"Searching for Nuke scripts (*.nk) in 'publish/nuke' subdirectories and filtering by version (max: {max_versions})...")
 
     for search_path_root in search_paths:
+        # os.walk explores the directory tree starting from search_path_root.
         for dirpath, dirnames, filenames in os.walk(search_path_root):
-            # Check if the current dirpath ends with 'publish/nuke'
-            # os.path.normpath to handle mixed slashes
+            # Normalize the path for consistent comparison (e.g., handles mixed slashes).
             norm_dirpath = os.path.normpath(dirpath)
+            # We are specifically looking for Nuke scripts in a 'publish/nuke' subdirectory.
+            # This is a common convention in VFX pipelines.
             if norm_dirpath.endswith(os.path.join("publish", "nuke")):
-                nuke_publish_dir = dirpath
+                nuke_publish_dir = dirpath # This is the '.../publish/nuke/' directory.
                 log.debug(f"Checking Nuke publish directory: {nuke_publish_dir}")
                 
+                # List all .nk files in this directory.
+                # sorted() here provides lexicographical sorting.
                 nk_files_in_dir = sorted(
                     [os.path.join(nuke_publish_dir, f) for f in os.listdir(nuke_publish_dir) if f.endswith(".nk") and os.path.isfile(os.path.join(nuke_publish_dir, f))]
                 )
-                # TODO: Implement robust version sorting (e.g., using natsort or regex-based version extraction)
-                # The current `sorted()` is lexicographical and may not be equivalent to `sort -V` from bash.
                 
                 if not nk_files_in_dir:
                     log.debug(f"  No .nk files found in {nuke_publish_dir}")
@@ -174,193 +272,233 @@ def find_and_filter_nuke_scripts(search_paths, max_versions):
                     scripts_to_add.extend(nk_files_in_dir)
                 elif max_versions == 1: # Archive LATEST version only
                     log.info(f"  Selecting LATEST version from {os.path.basename(nuke_publish_dir)} (max-versions = 1).")
-                    if nk_files_in_dir:
-                        scripts_to_add.append(nk_files_in_dir[-1])
+                    if nk_files_in_dir: # Should always be true if we got here
+                        scripts_to_add.append(nk_files_in_dir[-1]) # Get the last element (highest version by sort)
                 else: # Archive the latest N versions (max_versions > 1)
                     count = len(nk_files_in_dir)
-                    num_to_take = min(max_versions, count)
+                    num_to_take = min(max_versions, count) # Take at most 'max_versions' or all if fewer exist.
                     log.info(f"  Selecting LATEST {num_to_take} of {count} versions from {os.path.basename(nuke_publish_dir)} (max-versions = {max_versions}).")
-                    scripts_to_add.extend(nk_files_in_dir[-num_to_take:])
+                    scripts_to_add.extend(nk_files_in_dir[-num_to_take:]) # Get the last N elements
                 
                 all_found_scripts.extend(scripts_to_add)
                 if scripts_to_add:
                     log.info(f"  Added {len(scripts_to_add)} script(s) from {os.path.basename(nuke_publish_dir)} to the final list.")
     
     if not all_found_scripts:
-        log.warning("No Nuke scripts found matching the criteria in 'publish/nuke' directories.")
+        log.warning("No Nuke scripts found matching the criteria in 'publish/nuke' directories within the search paths.")
     else:
         log.info(f"Total Nuke scripts selected for archival: {len(all_found_scripts)}")
         for script_path in all_found_scripts:
-            log.debug(f"  - {script_path}")
+            log.debug(f"  - {script_path}") # Log each selected script at debug level
             
     return all_found_scripts
 
 def create_parser():
-    """Creates the argument parser for fixarc-handler."""
+    """Creates and configures the argparse.ArgumentParser for the script.
+
+    Defines all command-line arguments, their types, help messages, and default values.
+    A mutually exclusive group ensures that only one primary mode of operation
+    (project, episode, sequence, or shot) can be active.
+
+    Returns:
+        argparse.ArgumentParser: The configured argument parser.
+    """
     parser = argparse.ArgumentParser(
         description="Handles archiving Nuke scripts for projects, sequences, or shots using 'fixarc'.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter # Shows default values in --help
     )
+    # --- Mutually Exclusive Mode Group ---
+    # The user must specify one of these modes.
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument(
         "--project", type=str, dest="project_name_mode", metavar="PROJECT_NAME",
-        help="Archive published Nuke scripts in the project's 'shots' scope. Also serves as the required project context when using --episode, --sequence, or --shot."
+        help="Archive all published Nuke scripts in the specified project's 'shots' scope. "
+             "This argument also serves as the required project context when using "
+             "--episode, --sequence, or --shot flags."
     )
     mode_group.add_argument(
         "--episode", nargs='+', metavar="EPISODE_NAME",
-        help="Archive published Nuke scripts in the specified episode(s). Requires --project to be specified for context."
+        help="Archive published Nuke scripts in the specified episode(s). "
+             "Requires --project <PROJECT_NAME> to be specified for context."
     )
     mode_group.add_argument(
         "--sequence", nargs='+', metavar="SEQUENCE_NAME",
-        help="Archive published Nuke scripts in the specified sequence(s). Requires --project to be specified for context."
+        help="Archive published Nuke scripts in the specified sequence(s). "
+             "Requires --project <PROJECT_NAME> to be specified for context."
     )
     mode_group.add_argument(
         "--shot", nargs='+', metavar="SHOT_NAME",
-        help="Archive published Nuke scripts in the specified shot(s). Requires --project to be specified for context."
+        help="Archive published Nuke scripts in the specified shot(s). "
+             "Requires --project <PROJECT_NAME> to be specified for context."
     )
+
+    # --- Required Arguments ---
     parser.add_argument(
         "--archive-root", type=str, required=True,
-        help="Root directory path for the archive output structure."
+        help="Root directory path for the archive output structure (e.g., /mnt/archive/MYPROJ_archive)."
     )
+
+    # --- Optional Arguments ---
     parser.add_argument(
         "--base-path", type=str,
-        help="Override the default base path for projects (e.g., $FIXSTORE_DRIVE/proj)."
+        help="Override the default base path for projects (e.g., /mnt/studio/projects, Z:/proj). "
+             "If not set, defaults to $FIXSTORE_DRIVE/proj."
     )
     parser.add_argument(
         "--max-versions", type=int, default=1, metavar="N",
-        help="Number of latest versions to archive per shot: N <= 0: ALL; N == 1 (default): LATEST; N > 1: latest N."
+        help="Number of latest published script versions to archive per shot context: "
+             "N <= 0: ALL versions; N == 1 (default): LATEST version only; N > 1: latest N versions."
     )
     parser.add_argument(
-        "--client-config", type=str, metavar="PATH.json",
-        help="Path to a JSON config file for client-specific mapping rules (passed to fixarc)."
+        "--client-config", type=str, metavar="PATH/TO/config.json",
+        help="Path to a JSON configuration file for client-specific mapping rules (passed directly to 'fixarc')."
     )
     parser.add_argument(
         "--farm", action="store_true",
-        help="Submit each 'fixarc' process as a separate Deadline job."
+        help="Submit each 'fixarc' process as a separate Deadline render farm job."
     )
     parser.add_argument(
         "--fixarc-options", type=str, default="",
-        help="Quote enclosed string of *other* options passed directly to 'fixarc'."
+        help="A quote-enclosed string of *other* options to be passed directly to each 'fixarc' call "
+             "(e.g., \"--update-script --bake-gizmos --frame-range 1001-1050\")."
     )
     parser.add_argument(
         "-v", "--verbose", action="count", default=0,
-        help="Increase logging verbosity (-v for INFO, -vv for DEBUG)."
+        help="Increase logging verbosity. -v for INFO (default for this script if not using fixfx.log), "
+             "-vv for DEBUG. If using fixfx.log, this script respects its level but can be made more verbose."
     )
     return parser
 
 def main():
-    """Main execution function for fixarc-handler."""
+    """Main execution function for the fixarc-handler script.
+
+    Parses command-line arguments, sets up logging, determines the operating mode
+    and scripts to process, then either executes 'fixarc' locally or submits
+    jobs to a Deadline farm.
+    """
+    # --- Argument Parsing and Logging Setup ---
     parser = create_parser()
     args = parser.parse_args()
 
+    # Configure logging level based on verbosity flags.
+    # If using fixfx.log, its level is the base, but this script can increase its own verbosity.
     if args.verbose == 0:
+        # Default to INFO if no -v flags, unless fixfx.log is more verbose.
+        # The actual level check against fixfx.log's level isn't done here,
+        # log.setLevel will handle it. This sets the handler's logger specifically.
         log.setLevel(logging.INFO)
     elif args.verbose == 1:
         log.setLevel(logging.INFO) 
     elif args.verbose >= 2:
         log.setLevel(logging.DEBUG)
 
+    # Check if we are using the fixfx logger or the internal fallback.
     using_fixfx_log = False
     if 'fixfx' in sys.modules and hasattr(sys.modules['fixfx'], 'log'):
-        # Check if the 'log' we have is indeed the one from fixfx
-        # This is a bit more robust than just checking 'fixfx' in sys.modules
-        # as 'log' could have been None if the import failed silently or fixfx.log wasn't what we expected.
         try:
             from fixfx import log as fixfx_log_check
-            if log is fixfx_log_check:
+            if log is fixfx_log_check: # Verify it's the same logger instance
                  using_fixfx_log = True
-        except ImportError: # Should not happen if initial try/except for log worked and log is not None
-             pass
-
+        except ImportError:
+             pass # Should not happen if initial try/except for log worked.
 
     if using_fixfx_log:
-        log.info("fixarc-handler: Using logger from 'fixfx'.")
+        log.info("fixarc-handler: Using logger from 'fixfx' package.")
     else:
         log.info("fixarc-handler: Using internal basic logger ('fixarc.handler').")
-        if log.level > logging.WARNING: 
+        # Remind user if basic logging is active and not highly verbose, as fixfx.log might be preferred.
+        if log.level > logging.WARNING: # e.g. if log.level is INFO (20)
             log.warning("fixarc-handler: (Reminder) Could not import 'log' from 'fixfx'. Basic logging in use.")
 
-    log.debug(f"fixarc-handler: Logging level set to {logging.getLevelName(log.level)}.")
+    log.debug(f"fixarc-handler: Effective logging level set to {logging.getLevelName(log.level)}.")
     log.debug(f"Parsed arguments: {args}")
 
+    # --- Locate Essential Commands ---
     current_script_dir = os.path.dirname(os.path.realpath(__file__))
-    
+    # `fixarc` command is essential. Try to find it next to this script as a fallback.
     fixarc_cmd_path = get_command_path("fixarc", is_essential=True, relative_fallback_search_dirs=[current_script_dir])
-    log.info(f"Using fixarc command: {fixarc_cmd_path}")
+    log.info(f"Using 'fixarc' command: {fixarc_cmd_path}")
 
     deadline_cmd_path = None
     if args.farm:
+        # `deadlinecommand` is essential only if --farm mode is active.
         deadline_cmd_path = get_command_path("deadlinecommand", is_essential=True)
-        log.info(f"Using deadlinecommand: {deadline_cmd_path}")
+        log.info(f"Using 'deadlinecommand': {deadline_cmd_path}")
 
-    mode = None
-    project_name = None
-    names_to_process = []
+    # --- Determine Operating Mode and Target Names ---
+    mode = None # Will be one of "project", "episode", "sequence", "shot"
+    project_name = None # The overarching project context
+    names_to_process = [] # List of specific episodes, sequences, or shots
+
+    # The argparse mutually exclusive group ensures only one of these (project, episode, sequence, shot)
+    # is set as the *primary* mode argument.
+    # However, --project can also serve as a context for other modes.
 
     if args.project_name_mode:
-        # If --project is specified, it can be the mode OR the context.
-        # The mutually exclusive group ensures only one of --project, --episode, --sequence, --shot is the primary mode.
-        # If --project is the primary mode:
+        project_name = args.project_name_mode # Always take project name if --project is given
+        # If --project is the *only* mode flag given, then mode is "project"
         if not (args.episode or args.sequence or args.shot):
             mode = "project"
-        project_name = args.project_name_mode
     
+    # If other mode flags are given, they take precedence for 'mode',
+    # and --project (if given) provides the 'project_name' context.
     if args.episode:
-        if mode == "project": # --project was specified, but now we know --episode is the actual mode
-            log.debug("--project is context for --episode mode.")
+        if mode == "project": # This means --project was the only mode flag initially.
+            log.debug(f"--project '{project_name}' now serving as context for --episode mode.")
         mode = "episode"
         names_to_process = args.episode
-        project_name = args.project_name_mode # Project context comes from --project
-        if not project_name:
+        if not project_name: # Ensure project context was provided if --project wasn't the primary mode
             parser.error("--project <PROJECT_NAME> is required as context when using --episode.")
     elif args.sequence:
         if mode == "project":
-            log.debug("--project is context for --sequence mode.")
+            log.debug(f"--project '{project_name}' now serving as context for --sequence mode.")
         mode = "sequence"
         names_to_process = args.sequence
-        project_name = args.project_name_mode # Project context comes from --project
         if not project_name:
             parser.error("--project <PROJECT_NAME> is required as context when using --sequence.")
     elif args.shot:
         if mode == "project":
-            log.debug("--project is context for --shot mode.")
+            log.debug(f"--project '{project_name}' now serving as context for --shot mode.")
         mode = "shot"
         names_to_process = args.shot
-        project_name = args.project_name_mode # Project context comes from --project
         if not project_name:
             parser.error("--project <PROJECT_NAME> is required as context when using --shot.")
-    elif not mode: # This case means --project was given alone
-        mode = "project"
-        # project_name is already set from args.project_name_mode
-        # names_to_process remains empty for project mode
+    
+    # Final check, should be redundant due to argparse 'required=True' on the group
+    # and the logic above, but good for safety.
+    if not mode:
+        parser.error("A mode (--project, --episode, --sequence, or --shot) must be specified and parsed.")
+    if not project_name: # project_name must be set for all modes.
+         parser.error(f"Internal error: project_name not set for mode '{mode}'. This should not happen.")
 
-    if not project_name and mode != "project": # Double check, ensure project_name is set if not in project mode.
-        # This should be caught by specific mode checks above, but as a safeguard.
-        parser.error(f"--project <PROJECT_NAME> is required as context for --{mode} mode.")
-    elif not project_name and mode == "project" and not args.project_name_mode:
-        # This case should ideally not be reached if argparse is set up correctly with required=True for the group
-        parser.error("A mode (--project, --episode, --sequence, or --shot) must be specified.")
 
     log.info(f"Operating Mode: {mode}")
     log.info(f"Project Name: {project_name}")
-    if names_to_process:
+    if names_to_process: # Only log if there are specific names for episode, sequence, or shot mode
         log.info(f"Names to process: {names_to_process}")
     log.info(f"Archive Root: {args.archive_root}")
 
+    # --- Determine Base Path for Project Structure ---
     base_path_to_use = args.base_path
     if not base_path_to_use:
+        # If --base-path is not provided, attempt to use FIXSTORE_DRIVE environment variable.
         fixstore_drive = os.environ.get("FIXSTORE_DRIVE")
         if not fixstore_drive:
-            log.error("Cannot determine default base path. Please set FIXSTORE_DRIVE environment variable or use --base-path.")
+            log.error("Cannot determine default base path. "
+                      "Please set the FIXSTORE_DRIVE environment variable (e.g., 'W:' or '/mnt/fixstore') "
+                      "or use the --base-path argument.")
             sys.exit(1)
-        base_path_to_use = os.path.join(fixstore_drive, "proj")
+        base_path_to_use = os.path.join(fixstore_drive, "proj") # Standard convention: $FIXSTORE_DRIVE/proj
+    
+    # Normalize the path (e.g., converts slashes, resolves '..') for consistency.
     base_path_to_use = os.path.normpath(base_path_to_use)
     log.info(f"Using base project path: {base_path_to_use}")
 
+    # --- Find Nuke Scripts ---
     search_paths, missing_search_roots = build_search_paths(mode, project_name, names_to_process, base_path_to_use)
 
     if not search_paths:
-        log.error("No valid search paths could be determined to find Nuke scripts.")
+        log.error("No valid search paths could be determined to find Nuke scripts based on inputs.")
         if missing_search_roots:
             log.error("The following expected directories were missing or inaccessible:")
             for missing_path in missing_search_roots:
@@ -370,44 +508,51 @@ def main():
     found_scripts = find_and_filter_nuke_scripts(search_paths, args.max_versions)
 
     if not found_scripts:
-        log.error("Stopping because no Nuke scripts were found to process with the given criteria.")
-        if missing_search_roots:
+        log.error("Process halting: No Nuke scripts were found to process with the given criteria.")
+        if missing_search_roots: # Remind user if some paths were unsearchable
             log.warning("Note: The following expected directories were missing and could not be searched:")
             for missing_path in missing_search_roots:
                 log.warning(f"  - {missing_path}")
-        sys.exit(1)
+        sys.exit(1) # Exit if no scripts are found.
 
+    # If some directories were missing but scripts were still found elsewhere, prompt user to continue.
     if missing_search_roots:
-        log.warning("Some expected source directories were missing during the search:")
+        log.warning("Warning: Some expected source directories were missing during the Nuke script search:")
         for missing_path in missing_search_roots:
             log.warning(f"  - {missing_path}")
         try:
-            user_response = input("Do you want to continue archiving the found scripts? (y/N) ").strip().lower()
+            # Python's input() for user confirmation.
+            user_response = input("Do you want to continue archiving the scripts that were found? (y/N) ").strip().lower()
             if user_response != 'y':
-                log.info("User aborted.")
-                sys.exit(3) 
-        except EOFError: # Handle non-interactive environments
-            log.warning("Non-interactive environment, cannot prompt for missing directories. Aborting as per safety.")
-            sys.exit(3)
+                log.info("User aborted operation due to missing directories.")
+                sys.exit(3) # Exit code 3 for user abort.
+        except EOFError: # Handle non-interactive environments (e.g., automated scripts)
+            log.warning("Non-interactive environment detected. Cannot prompt for confirmation about missing directories. "
+                        "Aborting as a safety measure.")
+            sys.exit(3) # Abort in non-interactive if directories are missing.
 
-
+    # --- Process Found Scripts (Local Execution or Farm Submission) ---
     success_count = 0
     fail_count = 0
     try:
         current_user = os.getlogin()
-    except OSError: # os.getlogin() can fail in some non-interactive environments
+    except OSError: # os.getlogin() can fail in some non-interactive/daemonized environments
         current_user = os.environ.get('USER', os.environ.get('USERNAME', 'unknown_user'))
-
-    temp_job_submission_dir_root = None
     
+    # Parse --fixarc-options string into a list of arguments
     parsed_fixarc_options = []
     if args.fixarc_options:
         try:
+            # shlex.split is used for proper parsing of quoted strings within the options.
             parsed_fixarc_options = shlex.split(args.fixarc_options)
+            log.debug(f"Parsed --fixarc-options: {parsed_fixarc_options}")
         except Exception as e:
             log.error(f"Error parsing --fixarc-options string: '{args.fixarc_options}'. Error: {e}")
             log.warning("Proceeding without additional fixarc options due to parsing error.")
-            parsed_fixarc_options = []
+            # Continue with an empty list if parsing fails.
+    
+    # Create a main temporary directory for all Deadline job files if in farm mode.
+    # This helps in organizing and cleaning up temporary files.
     main_temp_dir_for_all_jobs = None
     try:
         if args.farm:
@@ -417,95 +562,114 @@ def main():
         for script_path in found_scripts:
             script_norm = os.path.normpath(script_path)
             script_basename = os.path.basename(script_norm)
-            log.info(f"--- Preparing '{script_basename}' ---")
+            log.info(f"--- Preparing '{script_basename}' for archival ---")
 
+            # Construct the base command for 'fixarc'
             base_cmd_args = [fixarc_cmd_path, script_norm, "--archive-root", args.archive_root]
+            
+            # Add client config if specified
             if args.client_config:
                 if not os.path.isfile(args.client_config):
-                    log.error(f"Client config file not found: {args.client_config}. Skipping this script: {script_basename}")
+                    log.error(f"Client config file not found: {args.client_config}. "
+                              f"Skipping archival for script: {script_basename}")
                     fail_count +=1
-                    continue
+                    continue # Skip to the next script
                 base_cmd_args.extend(["--client-config", args.client_config])
             
+            # Add any passthrough options for 'fixarc'
             if parsed_fixarc_options:
                 base_cmd_args.extend(parsed_fixarc_options)
 
-            if not args.farm:
-                log.info(f"Executing locally: {' '.join(base_cmd_args)}")
+            # --- Execute fixarc (Locally or via Farm) ---
+            if not args.farm: # Local execution
+                log.info(f"Executing 'fixarc' locally: {' '.join(base_cmd_args)}")
                 try:
-                    # For local execution, inherit stdio unless verbose debugging of fixarc is needed
+                    # subprocess.run executes the command.
+                    # check=True will raise CalledProcessError if fixarc exits with non-zero status.
+                    # capture_output=True to get stdout/stderr from fixarc.
                     process = subprocess.run(base_cmd_args, check=True, capture_output=True, text=True, encoding='utf-8')
                     log.info(f"Successfully archived locally: {script_basename}")
-                    if process.stdout: log.debug(f"fixarc stdout for {script_basename}:\n{process.stdout}")
-                    if process.stderr: log.debug(f"fixarc stderr for {script_basename}:\n{process.stderr}") # fixarc might log to stderr too
+                    if process.stdout: log.debug(f"fixarc stdout for {script_basename}:\n{process.stdout.strip()}")
+                    if process.stderr: log.debug(f"fixarc stderr for {script_basename}:\n{process.stderr.strip()}")
                     success_count += 1
                 except subprocess.CalledProcessError as e:
-                    log.error(f"'fixarc' failed locally for: {script_basename} (Exit code: {e.returncode})")
-                    if e.stdout: log.error(f"fixarc stdout:\n{e.stdout}")
-                    if e.stderr: log.error(f"fixarc stderr:\n{e.stderr}")
+                    log.error(f"'fixarc' command failed locally for: {script_basename} (Exit code: {e.returncode})")
+                    if e.stdout: log.error(f"fixarc stdout:\n{e.stdout.strip()}")
+                    if e.stderr: log.error(f"fixarc stderr:\n{e.stderr.strip()}")
                     fail_count += 1
-                except FileNotFoundError: # Should be caught by get_command_path earlier
-                    log.error(f"fixarc command not found at {fixarc_cmd_path} during execution attempt.")
-                    fail_count += 1 # Or exit, as this is a critical setup issue
-                    break # Stop processing further scripts if fixarc is suddenly gone
-            else: # Farm mode
-                log.info(f"Submitting to Deadline farm: {script_basename}")
+                except FileNotFoundError: # Should be caught by get_command_path earlier for fixarc_cmd_path
+                    log.error(f"Critical error: 'fixarc' command not found at {fixarc_cmd_path} during execution attempt. Halting.")
+                    fail_count += 1 
+                    break # Stop processing further scripts if fixarc is suddenly gone. This is a fatal error.
+            
+            else: # Farm submission mode (Deadline)
+                log.info(f"Submitting 'fixarc' job to Deadline farm for: {script_basename}")
                 
-                job_name = f"FixArc_Handler: {project_name}_{script_basename}"
+                # Sanitize job name for Deadline and file system
+                job_name = f"FixArc_Handler: {project_name} - {script_basename}"
                 job_name_sanitized = "".join(c if c.isalnum() or c in ('_', '-', '.', ':') else '_' for c in job_name).strip()
-                if not job_name_sanitized: job_name_sanitized = f"fixarc_job_{script_basename}"
+                if not job_name_sanitized: # Ensure a valid name
+                    job_name_sanitized = f"fixarc_job_{script_basename.replace('.', '_')}" # Fallback if sanitization results in empty
                 
-                # Replace common problematic characters for filenames
+                # Create filenames for Deadline job info files.
                 job_file_basename = job_name_sanitized.replace(':', '_').replace(' ', '_').replace('\\', '_').replace('/', '_')
                 job_info_filename = f"{job_file_basename}.job"
-                plugin_info_filename = f"{job_file_basename}.plugin" # If needed for more complex plugin args
+                # plugin_info_filename = f"{job_file_basename}.plugin" # Not used in this basic setup
 
                 job_info_file_path = os.path.join(main_temp_dir_for_all_jobs, job_info_filename)
 
-                # Deadline arguments are just the arguments to fixarc, not fixarc itself.
+                # Arguments for the Deadline CommandLine plugin are the arguments to `fixarc` (excluding `fixarc` itself).
+                # Ensure arguments are properly quoted for the command line.
                 deadline_job_args_str = ' '.join(f'"{arg}"' for arg in base_cmd_args[1:]) 
 
+                # Content for the Deadline .job file (Plugin=CommandLine)
                 job_info_content = [
                     f"Plugin=CommandLine",
                     f"Name={job_name_sanitized}",
                     f"Comment=Archive {script_norm} via fixarc-handler for project {project_name}",
                     f"UserName={current_user}",
-                    f"Frames=0", # Assuming single frame/task for this type of job
-                    f"InitialStatus=Active", # Or Queued
-                    f"MachineLimit=1", # Typically 1 for such tasks
-                    # Optional: Pool=your_pool, Group=your_group
-                    # Optional: Priority=50
-                    # Optional: OutputDirectory0=... OutputFilename0=... (if job produces specific files)
-                    f"Executable={base_cmd_args[0]}", # This is fixarc_cmd_path
-                    f"Arguments={deadline_job_args_str}"
+                    f"Frames=0", # Single task job for archiving one script
+                    f"InitialStatus=Active", # Or "Queued"
+                    f"MachineLimit=1", # Usually, such tasks run on one machine.
+                    # Optional Deadline parameters:
+                    # f"Pool=your_pool",
+                    # f"Group=your_group",
+                    # f"Priority=50",
+                    # f"OutputDirectory0=...", # If fixarc produces specific output files logged by Deadline
+                    # f"OutputFilename0=...",
+                    f"Executable={shlex.quote(base_cmd_args[0])}", # Path to fixarc, quoted
+                    f"Arguments={deadline_job_args_str}" # Arguments for fixarc
                 ]
-                # Optional: StartInDirectory={os.path.dirname(base_cmd_args[0])}
+                # Optional: StartInDirectory={shlex.quote(os.path.dirname(base_cmd_args[0]))}
 
                 try:
+                    # Write the .job file
                     with open(job_info_file_path, 'w', encoding='utf-8') as f:
                         f.write("\n".join(job_info_content) + "\n")
                     log.debug(f"  Deadline Job Info file written to: {job_info_file_path}")
 
+                    # Construct the deadlinecommand call
                     deadline_submission_cmd = [deadline_cmd_path, job_info_file_path]
-                    # If plugin file is used: deadline_submission_cmd.append(plugin_info_file_path)
+                    # If a plugin info file were used: deadline_submission_cmd.append(plugin_info_file_path)
 
                     log.info(f"  Submitting Deadline job: {' '.join(deadline_submission_cmd)}")
                     process = subprocess.run(deadline_submission_cmd, check=True, capture_output=True, text=True, encoding='utf-8')
                     log.info(f"  Successfully submitted job for {script_basename} to Deadline.")
-                    if process.stdout: log.debug(f"  Deadlinecommand stdout:\n{process.stdout}")
-                    if process.stderr: log.debug(f"  Deadlinecommand stderr:\n{process.stderr}")
+                    if process.stdout: log.debug(f"  Deadlinecommand stdout:\n{process.stdout.strip()}")
+                    if process.stderr: log.debug(f"  Deadlinecommand stderr:\n{process.stderr.strip()}")
                     success_count += 1
                 except subprocess.CalledProcessError as e:
                     log.error(f"  Failed to submit job for {script_basename} to Deadline (Exit code: {e.returncode}).")
-                    if e.stdout: log.error(f"  deadlinecommand stdout:\n{e.stdout}")
-                    if e.stderr: log.error(f"  deadlinecommand stderr:\n{e.stderr}")
+                    if e.stdout: log.error(f"  deadlinecommand stdout:\n{e.stdout.strip()}")
+                    if e.stderr: log.error(f"  deadlinecommand stderr:\n{e.stderr.strip()}")
                     fail_count += 1
-                except Exception as e: # Catch other errors like file writing issues
+                except Exception as e: # Catch other errors like file writing issues for the .job file
                     log.error(f"  An unexpected error occurred during Deadline job submission for {script_basename}: {e}")
                     fail_count += 1
-            log.info("------------------------------")
+            log.info("------------------------------") # Separator for logs per script
 
     finally:
+        # Cleanup the main temporary directory used for Deadline job files.
         if main_temp_dir_for_all_jobs and os.path.isdir(main_temp_dir_for_all_jobs):
             log.debug(f"Cleaning up root temporary directory for Deadline jobs: {main_temp_dir_for_all_jobs}")
             try:
@@ -513,29 +677,30 @@ def main():
             except Exception as e:
                 log.error(f"Failed to cleanup temporary directory {main_temp_dir_for_all_jobs}: {e}")
 
-
+    # --- Final Summary ---
     log.info("--- Archiving Process Summary ---")
     if args.farm:
-        log.info(f"Deadline job submission complete.")
-        log.info(f"Jobs successfully submitted: {success_count}")
-        log.info(f"Jobs failed to submit: {fail_count}")
+        log.info(f"Deadline job submission process complete.")
+        log.info(f"Jobs successfully submitted to Deadline: {success_count}")
+        log.info(f"Jobs failed to submit to Deadline: {fail_count}")
         log.info("Note: Check Deadline Monitor for the actual completion status of submitted jobs.")
     else:
-        log.info(f"Local archiving complete.")
+        log.info(f"Local 'fixarc' execution complete.")
         log.info(f"Scripts successfully archived: {success_count}")
         log.info(f"Scripts failed to archive: {fail_count}")
 
-    if missing_search_roots: # Remind user at the end as well
-        log.warning("Reminder: Some expected source directories were missing during the search:")
+    if missing_search_roots: # Remind user at the end as well if some directories were not found
+        log.warning("Reminder: Some expected source directories were missing during the search process:")
         for missing_path in missing_search_roots:
             log.warning(f"  - {missing_path}")
 
     if fail_count > 0:
         log.info("fixarc-handler finished with errors.")
-        sys.exit(1)
+        sys.exit(1) # Exit with error code 1 if any failures occurred.
     else:
         log.info("fixarc-handler finished successfully.")
-        sys.exit(0)
+        sys.exit(0) # Exit with success code 0.
 
 if __name__ == "__main__":
+    # This ensures main() is called only when the script is executed directly.
     main() 
