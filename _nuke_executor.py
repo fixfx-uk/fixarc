@@ -209,6 +209,18 @@ def _collect_dependency_paths(nodes: Set[nuke.Node]) -> Dict[str, Dict[str, Any]
     """
     dependency_paths: Dict[str, Dict[str, Any]] = {}
     _log_print("info", f"Collecting dependency paths from {len(nodes)} nodes...")
+    script_dir = None # Initialize script_dir
+    # Get script_dir once if there are nodes to process, as nuke.root().name() might be slow
+    if nodes:
+        try:
+            current_script_name = nuke.root().name()
+            if current_script_name and current_script_name != "Root": # Ensure script has a name
+                 script_dir = os.path.dirname(current_script_name)
+            else:
+                _log_print("warning", "Script has no name or is 'Root'. Relative paths may not resolve correctly.")
+        except RuntimeError as e:
+            _log_print("warning", f"Could not get script name for resolving relative paths: {e}")
+
 
     for i, node in enumerate(nodes): # Added index for logging
         node_name = node.fullName()
@@ -241,9 +253,10 @@ def _collect_dependency_paths(nodes: Set[nuke.Node]) -> Dict[str, Dict[str, Any]
                      continue # Skip empty evaluated paths
 
                 # Resolve relative paths against current script path
-                if not os.path.isabs(evaluated_path):
-                     script_dir = os.path.dirname(nuke.root().name())
+                if script_dir and not os.path.isabs(evaluated_path): # Check if script_dir was obtained
                      evaluated_path = os.path.abspath(os.path.join(script_dir, evaluated_path))
+                elif not os.path.isabs(evaluated_path):
+                    _log_print("warning", f"Cannot resolve relative path '{evaluated_path}' for '{node_name}.{knob_name}' as script directory is unavailable.")
 
                 # Normalize slashes
                 evaluated_path = evaluated_path.replace("\\", "/")
@@ -317,9 +330,6 @@ def _bake_gizmos(nodes_to_check: Set[nuke.Node]) -> Tuple[int, Set[nuke.Node]]:
 
              if not in_nuke_plugins_dir:
                   should_bake = True
-        # Decide if non-file-based, non-native nodes should be baked (risky)
-        # elif not is_likely_native:
-        #      _log_print("warning", f"Node {node_name} ({node_class}) is non-native but not file-based. Baking not attempted.")
 
         # --- Perform Bake ---
         if should_bake:
@@ -386,6 +396,18 @@ def _repath_nodes(
     repath_count = 0
     failed_repaths: List[str] = []
 
+    script_dir = None # Initialize script_dir
+    # Get script_dir once if there are nodes to process, as nuke.root().name() might be slow
+    if nodes_to_repath:
+        try:
+            current_script_name = nuke.root().name()
+            if current_script_name and current_script_name != "Root": # Ensure script has a name
+                 script_dir = os.path.dirname(current_script_name)
+            else:
+                _log_print("warning", "Script has no name or is 'Root' during repathing. Relative paths may not resolve correctly.")
+        except RuntimeError as e:
+            _log_print("warning", f"Could not get script name for resolving relative paths during repathing: {e}")
+
     # Create a reverse map for faster lookup if needed, but iterating nodes is likely clearer
     # archived_to_original = {v: k for k, v in dependency_map.items() if v}
 
@@ -410,11 +432,14 @@ def _repath_nodes(
                 if not current_eval_path_raw: continue # Skip empty knobs
 
                 # Resolve if relative and normalize
-                if not os.path.isabs(current_eval_path_raw):
-                     script_dir = os.path.dirname(nuke.root().name())
+                if script_dir and not os.path.isabs(current_eval_path_raw): # Check if script_dir was obtained
                      current_eval_path = os.path.abspath(os.path.join(script_dir, current_eval_path_raw))
+                elif not os.path.isabs(current_eval_path_raw):
+                     current_eval_path = current_eval_path_raw # Keep as is, but log
+                     _log_print("warning", f"Cannot resolve relative path '{current_eval_path_raw}' for '{node_name}.{knob_name}' during repath as script directory is unavailable. Path kept as original.")
                 else:
                      current_eval_path = current_eval_path_raw
+
                 current_eval_path = current_eval_path.replace("\\", "/")
 
                 # Check if this evaluated path is one we archived
@@ -524,7 +549,7 @@ def repath_script_knobs(
     should_repath: bool,
     archive_root: str,
     final_script_path: str,
-    metadata_json: str
+    metadata_dict: Dict[str, Any]
 ) -> Tuple[Dict[str, str], int]:
     """
     Repaths script knobs if requested.
@@ -545,7 +570,7 @@ def repath_script_knobs(
 
     # For each dependency path collected earlier, calculate its final destination.
     _log_print("debug", "Calculating final archive paths for repathing...")
-    temp_metadata = json.loads(metadata_json)
+    temp_metadata = metadata_dict
     
     # First process each dependency to map to archive destination
     for node_knob, data in dependency_info.items():
@@ -684,14 +709,14 @@ def save_pruned_script(nodes: Set[nuke.Node], final_script_path: str, archive_ro
             except Exception as e:
                 _log_print("warning", f"Failed to remove custom temp file {temp_nodes_file}: {e}")
 
-def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_root: str, metadata_json: str) -> Dict[str, str]:
+def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_root: str, metadata_dict: Dict[str, Any]) -> Dict[str, str]:
     """
     Generates the final dependency map for copying files.
     Constructs archive paths preserving relative structure after the shot folder.
     """
     dependencies_to_copy = {}
     _log_print("debug", "Generating final dependency map for copying...")
-    temp_metadata = json.loads(metadata_json)
+    temp_metadata = metadata_dict
     # Construct the expected shot code pattern (e.g., BOB_101_00X_010_WIG)
     # Use metadata which should be reliable
     shot_code_parts = [
@@ -805,6 +830,26 @@ def run_nuke_tasks(args: argparse.Namespace) -> Dict[str, Any]:
     # Log relevant environment variables
     _log_print("debug", f"NUKE_PATH env: {os.environ.get('NUKE_PATH', 'Not Set')}")
 
+    # Parse metadata_json once here
+    metadata_dict: Optional[Dict[str, Any]] = None
+    try:
+        if args.metadata_json:
+            metadata_dict = json.loads(args.metadata_json)
+        else:
+            errors.append("metadata_json was not provided to run_nuke_tasks.")
+            _log_print("error", "metadata_json is missing.")
+            # Depending on strictness, could raise ConfigurationError here
+    except json.JSONDecodeError as jde:
+        errors.append(f"Failed to parse metadata_json: {jde}")
+        _log_print("error", f"JSON parsing error for metadata: {jde}")
+        # Depending on strictness, could raise ConfigurationError here
+
+    if metadata_dict is None: # If parsing failed or was not provided
+        results["status"] = "failure"
+        results["errors"] = errors
+        _log_print("error", "--- Nuke Task Execution FAILED due to metadata issues ---")
+        return results
+
     try:
         # 1. Load Input Script
         _log_print("info", "Step 1: Loading Input Script...")
@@ -852,7 +897,7 @@ def run_nuke_tasks(args: argparse.Namespace) -> Dict[str, Any]:
             args.repath_script,
             args.archive_root, 
             args.final_script_archive_path,
-            args.metadata_json
+            metadata_dict
         )
         results["repath_count"] = repath_count
         _log_print("info", f"Step 8: Repath Script Knobs COMPLETED. Repathed {repath_count} knobs.")
@@ -873,7 +918,7 @@ def run_nuke_tasks(args: argparse.Namespace) -> Dict[str, Any]:
             dependencies_to_copy = generate_dependency_map(
                 dependency_info, 
                 args.archive_root, 
-                args.metadata_json
+                metadata_dict
             )
             results["dependencies_to_copy"] = dependencies_to_copy
             _log_print("info", f"Step 10: Generate Final Dependency Map COMPLETED. Found {len(dependencies_to_copy)} files to copy.")

@@ -14,6 +14,7 @@ import subprocess
 
 def main():
     """Modify sys.path and use runpy to run the fixarc CLI module."""
+    target_module = "fixarc.cli" # Use fully qualified module name with package prefix
     try:
         # Get the directory where this script (fixarc) is located
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -38,22 +39,14 @@ def main():
         try:
             import fixenv
         except ImportError as e:
-            fixenv = None # Crucial: define 'fixenv' if import fails
+            raise ImportError(f"Failed to import fixenv: {e}")
             
         # Import fixfx.log for logging
         try:
             from fixfx import log
         except ImportError:
-            # Fall back to stderr if fixfx.log can't be imported
-            import logging
-            logging.basicConfig(level=logging.DEBUG)
-            log = logging.getLogger("fixarc.wrapper")
-            log.warning("Could not import fixfx.log, using basic logging")
+            raise ImportError("Failed to import fixfx.log")
             
-        # Now that we have log, we can log the paths we added
-        log.info(f"Using project root: {project_root}")
-        log.info(f"Using fixenv root: {fixenv_root}")
-
         # --- Bootstrap fixenv environment ---
         try:
             # Check for config file existence before running fixe
@@ -145,7 +138,6 @@ def main():
             except Exception as e:
                 log.error(f"Manual NUKE_PATH setup failed: {e}")
         
-        target_module = "fixarc.cli" # Use fully qualified module name with package prefix
         log.info(f"Attempting to run module '{target_module}'")
         log.debug(f"sys.path: {sys.path}")
 
