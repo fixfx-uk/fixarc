@@ -18,11 +18,11 @@ def _get_spt_directory(
 ) -> Path:
     """
     Constructs the absolute SPT directory path for a given category within the archive.
-    The structure is: {archive_root}/{vendor}/{show}/{episode}/{shot}/{relative_category_path}
+    The structure is: {archive_root}/{vendor}/{show}/{episode}/{episode}_{sequence}_{shot}_{tag}/{relative_category_path}
 
     Args:
         archive_root: The absolute root path of the archive destination.
-        metadata: Dictionary containing required keys ('vendor', 'show', 'episode', 'shot').
+        metadata: Dictionary containing required keys ('vendor', 'show', 'episode', 'sequence', 'shot', 'tag').
         relative_category_path: The relative path within the shot folder determined by
                                 mapping rules (e.g., 'assets/images', 'projects/nuke').
                                 If empty, returns the base shot directory path.
@@ -53,23 +53,24 @@ def _get_spt_directory(
             return sanitized
 
         # Ensure required keys exist before sanitizing
-        required_keys = ['vendor', 'show', 'episode', 'shot']
+        required_keys = ['vendor', 'show', 'episode', 'sequence', 'shot', 'tag']
         missing_keys = [k for k in required_keys if k not in metadata or not metadata[k]]
         if missing_keys:
              raise KeyError(f"Missing required metadata key(s): {', '.join(missing_keys)}")
 
         vendor = sanitize_for_path(metadata['vendor'], 'vendor')
         show = sanitize_for_path(metadata['show'], 'show')
-        # Season is no longer used here
         episode = sanitize_for_path(metadata['episode'], 'episode')
+        sequence = sanitize_for_path(metadata['sequence'], 'sequence')
         shot = sanitize_for_path(metadata['shot'], 'shot')
+        tag = sanitize_for_path(metadata['tag'], 'tag')
 
         # --- Construct Base Path (Vendor/Show/Episode/Shot) ---
         base = Path(archive_root) / \
                constants.VENDOR_DIR.format(vendor=vendor) / \
                constants.SHOW_DIR.format(show=show) / \
                constants.EPISODE_DIR.format(episode=episode) / \
-               constants.SHOT_DIR.format(shot=shot)
+               constants.SHOT_DIR.format(episode=episode, sequence=sequence, shot=shot, tag=tag)
 
         # --- Add Relative Category Path (if provided) ---
         full_dir_path = base

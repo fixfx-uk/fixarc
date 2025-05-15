@@ -15,7 +15,7 @@ DEFAULT_VENDOR_NAME = getattr(fixenv.constants, 'STUDIO_SHORT_NAME', 'FixFX')
 VENDOR_DIR: str = "{vendor}"
 SHOW_DIR: str = "{show}"
 EPISODE_DIR: str = "{episode}"
-SHOT_DIR: str = "{shot}"
+SHOT_DIR: str = "{episode}_{sequence}_{shot}_{tag}"
 
 # --- Relative Archive Paths within SHOT_DIR ---
 def _rel_path(*args: str) -> str:

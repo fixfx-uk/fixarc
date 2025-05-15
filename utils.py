@@ -10,6 +10,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Union
+import sys
 
 # --- Fixenv Integration ---
 # fixenv is a hard dependency
@@ -394,6 +395,7 @@ def copy_file_or_sequence(source: str, dest: str, frame_range: Optional[Tuple[in
                 if dry_run:
                     log.info(f"[DRY RUN] Would copy frame: {src} -> {dst}")
                     copied_pairs.append((src, dst))
+                    print(".", end="", flush=True) # Progress per frame (dry run)
                 else:
                     src_path_obj = Path(src)
                     if not src_path_obj.is_file():
@@ -403,6 +405,7 @@ def copy_file_or_sequence(source: str, dest: str, frame_range: Optional[Tuple[in
                     try:
                         shutil.copy2(src, dst)
                         copied_pairs.append((src, dst))
+                        print(".", end="", flush=True) # Progress per frame
                     except Exception as e:
                         log.error(f"Failed to copy frame {src} -> {dst}: {e}")
                         # Continue trying other frames
@@ -413,6 +416,7 @@ def copy_file_or_sequence(source: str, dest: str, frame_range: Optional[Tuple[in
             if dry_run:
                 log.info(f"[DRY RUN] Would copy: {norm_source} -> {norm_dest}")
                 copied_pairs.append((norm_source, norm_dest))
+                print(".", end="", flush=True) # Progress for single file dry run
             else:
                 try:
                     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -427,6 +431,8 @@ def copy_file_or_sequence(source: str, dest: str, frame_range: Optional[Tuple[in
                 try:
                     shutil.copy2(norm_source, norm_dest)
                     copied_pairs.append((norm_source, norm_dest))
+                    print(".", end="", flush=True) # Progress for single file copy
+                    log.debug(f"Successfully copied single file: {norm_source} to {norm_dest}")
                 except Exception as e:
                     log.error(f"Failed to copy {norm_source} -> {norm_dest}: {e}")
                     return [] # Fail if single file copy fails
@@ -459,6 +465,7 @@ def copy_files_robustly(
     total_expected = len(dependencies_to_copy)
     log.info(f"Starting robust file copy process for {total_expected} dependency item(s)...")
     processed_sequences = set() # Track sequence patterns already handled
+    dots_printed = False # Flag to track if any dots were printed
 
     items = list(dependencies_to_copy.items())
     items.sort() # Process in a predictable order (helps with sequence handling)
@@ -536,14 +543,24 @@ def copy_files_robustly(
                            copy_success = False
                       else:
                            log.info(f"Successfully copied '{norm_source}' using external tool.")
+                           print(".", end="", flush=True)
+                           dots_printed = True
                            copy_success = True
             else:
                  # Use Shutil Fallback
                  # Frame range determination happens inside copy_file_or_sequence now
+                 # copy_file_or_sequence will print its own dots
+                 original_stdout = sys.stdout # Keep track of original stdout
+                 # Redirect stdout for the duration of this call if we want to capture dots, but for now, let it print directly
+                 
                  copied_pairs = copy_file_or_sequence(norm_source, norm_dest, frame_range=None, dry_run=dry_run)
+                 
                  if copied_pairs: # Function returns list of successful copies
                      copy_success = True
                      num_files_in_op = len(copied_pairs) if is_seq else 1
+                     # If copy_file_or_sequence printed dots, ensure our flag is set
+                     if num_files_in_op > 0:
+                         dots_printed = True 
                  else:
                      # copy_file_or_sequence logs errors internally
                      log.error(f"Shutil copy failed or resulted in zero files for: {norm_source}")
@@ -573,6 +590,9 @@ def copy_files_robustly(
         log.info(f"[DRY RUN] Simulated copy process finished. Potential Success: {success_count}, Failures: {failure_count}")
     else:
         log.info(f"Robust copy process finished. Files Copied: {success_count}, Failures: {failure_count}")
+
+    if dots_printed:
+        print() # Print a newline character if dots were printed
 
     return success_count, failure_count
 

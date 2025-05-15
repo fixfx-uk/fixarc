@@ -559,10 +559,15 @@ def main():
             main_temp_dir_for_all_jobs = tempfile.mkdtemp(prefix="fixarc_handler_jobs_")
             log.debug(f"Created root temporary directory for Deadline job files: {main_temp_dir_for_all_jobs}")
 
-        for script_path in found_scripts:
+        total_scripts = len(found_scripts)
+        log.info(f"Starting archival process for {total_scripts} Nuke script(s)...")
+
+        for i, script_path in enumerate(found_scripts):
             script_norm = os.path.normpath(script_path)
             script_basename = os.path.basename(script_norm)
-            log.info(f"--- Preparing '{script_basename}' for archival ---")
+            
+            # Log which script is being processed with count
+            log.info(f"--- Processing script [{i+1}/{total_scripts}]: '{script_basename}' ---")
 
             # Construct the base command for 'fixarc'
             base_cmd_args = [fixarc_cmd_path, script_norm, "--archive-root", args.archive_root]
@@ -582,25 +587,25 @@ def main():
 
             # --- Execute fixarc (Locally or via Farm) ---
             if not args.farm: # Local execution
-                log.info(f"Executing 'fixarc' locally: {' '.join(base_cmd_args)}")
+                log.info(f"Executing 'fixarc' locally for {script_basename}...") # Indicate start of execution
+                # The actual command string will be logged by the debug log of shlex.split in subprocess.run below if needed
                 try:
-                    # subprocess.run executes the command.
-                    # check=True will raise CalledProcessError if fixarc exits with non-zero status.
-                    # capture_output=True to get stdout/stderr from fixarc.
-                    process = subprocess.run(base_cmd_args, check=True, capture_output=True, text=True, encoding='utf-8')
-                    log.info(f"Successfully archived locally: {script_basename}")
+                    process = subprocess.run(base_cmd_args, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+                    # No exception means success
+                    log.info(f"Successfully archived: {script_basename}")
                     if process.stdout: log.debug(f"fixarc stdout for {script_basename}:\n{process.stdout.strip()}")
                     if process.stderr: log.debug(f"fixarc stderr for {script_basename}:\n{process.stderr.strip()}")
                     success_count += 1
                 except subprocess.CalledProcessError as e:
-                    log.error(f"'fixarc' command failed locally for: {script_basename} (Exit code: {e.returncode})")
+                    log.error(f"'fixarc' command FAILED for: {script_basename} (Exit code: {e.returncode})")
                     if e.stdout: log.error(f"fixarc stdout:\n{e.stdout.strip()}")
                     if e.stderr: log.error(f"fixarc stderr:\n{e.stderr.strip()}")
                     fail_count += 1
-                except FileNotFoundError: # Should be caught by get_command_path earlier for fixarc_cmd_path
-                    log.error(f"Critical error: 'fixarc' command not found at {fixarc_cmd_path} during execution attempt. Halting.")
+                except FileNotFoundError: 
+                    log.error(f"Critical error: 'fixarc' command not found at {fixarc_cmd_path} during execution attempt. Halting for {script_basename}.")
                     fail_count += 1 
-                    break # Stop processing further scripts if fixarc is suddenly gone. This is a fatal error.
+                    # Optionally, decide if this is fatal for all scripts or just this one
+                    # break 
             
             else: # Farm submission mode (Deadline)
                 log.info(f"Submitting 'fixarc' job to Deadline farm for: {script_basename}")

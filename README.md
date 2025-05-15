@@ -77,13 +77,13 @@ Below are examples using a hypothetical project structure on a Windows `W:` driv
 **Using the wrapper script (recommended):**
 
 ```bash
-fixarc "W:\\proj\\sandbox\\shots\\BOB_101\\BOB_101_002\\BOB_101_002_030_CLN\\Comp\\work\\robin-d\\nuke\\BOB_101_002_030_CLN_Comp_v005.nk" --archive-root "W:\\proj\\sandbox\\delivery\\archive" --vendor "FixFX" --shot-name "BOB_101_002_030"
+fixarc "W:\proj\sandbox\shots\BOB_101\BOB_101_002\BOB_101_002_030_CLN\Comp\work\robin-d\nuke\BOB_101_002_030_CLN_Comp_v005.nk" --archive-root "W:\proj\sandbox\delivery\archive" --vendor "FixFX" --shot-name "BOB_101_002_030"
 ```
 
 **Running as a Python module:**
 
 ```bash
-python -m fixarc.cli "W:\\proj\\sandbox\\shots\\BOB_101\\BOB_101_002\\BOB_101_002_030_CLN\\Comp\\work\\robin-d\\nuke\\BOB_101_002_030_CLN_Comp_v005.nk" --archive-root "W:\\proj\\sandbox\\delivery\\archive" --vendor "FixFX" --shot-name "BOB_101_002_030"
+python -m fixarc.cli "W:\proj\sandbox\shots\BOB_101\BOB_101_002\BOB_101_002_030_CLN\Comp\work\robin-d\nuke\BOB_101_002_030_CLN_Comp_v005.nk" --archive-root "W:\proj\sandbox\delivery\archive" --vendor "FixFX" --shot-name "BOB_101_002_030"
 ```
 
 **Common Optional Flags:**
@@ -97,7 +97,7 @@ python -m fixarc.cli "W:\\proj\\sandbox\\shots\\BOB_101\\BOB_101_002\\BOB_101_00
 
 **Example with optional flags (dry run, update script, bake gizmos):**
 ```bash
-fixarc "W:\\\\proj\\\\sandbox\\\\shots\\\\BOB_101\\\\BOB_101_002\\\\BOB_101_002_030_CLN\\\\Comp\\\\work\\\\robin-d\\\\nuke\\\\BOB_101_002_030_CLN_Comp_v005.nk" --archive-root "W:\\\\proj\\\\sandbox\\\\delivery\\\\archive" --vendor "FixFX" --shot-name "BOB_101_002_030" --update-script --bake-gizmos --dry-run
+fixarc "W:\proj\sandbox\shots\BOB_101\BOB_101_002\BOB_101_002_030_CLN\Comp\work\robin-d\nuke\BOB_101_002_030_CLN_Comp_v005.nk" --archive-root "W:\proj\sandbox\delivery\archive" --vendor "FixFX" --shot-name "BOB_101_002_030" --update-script --bake-gizmos --dry-run
 ```
 
 ## Batch Archiving with `fixarc-handler`
@@ -122,8 +122,8 @@ python path/to/fixarc/bin/fixarc-handler --project <PROJECT_NAME> ...
 *   `--episode EPISODE_NAME [EPISODE_NAME ...]`: Archives scripts from the specified episode(s) within the given `--project`.
 *   `--sequence SEQUENCE_NAME [SEQUENCE_NAME ...]`: Archives scripts from the specified sequence(s) within the given `--project`.
 *   `--shot SHOT_NAME [SHOT_NAME ...]`: Archives scripts from the specified shot(s) within the given `--project`.
-*   `--archive-root ARCHIVE_ROOT_PATH`: **Required.** The root directory where the archives will be created (e.g., `W:\\proj\\sandbox\\delivery\\archive`).
-*   `--base-path BASE_PROJECT_PATH`: Overrides the default project base path (e.g., `W:\\proj\\sandbox`). If not set, it often relies on an environment variable like `FIXSTORE_DRIVE`.
+*   `--archive-root ARCHIVE_ROOT_PATH`: **Required.** The root directory where the archives will be created (e.g., `W:\proj\sandbox\delivery\archive`).
+*   `--base-path BASE_PROJECT_PATH`: Overrides the default project base path (e.g., `W:\proj`). If not set, it often relies on an environment variable like `FIXSTORE_DRIVE`.
 *   `--max-versions N`: Number of latest published script versions to archive per shot. `0` means all versions, `1` (default) means only the latest, `N > 1` means the latest `N` versions.
 *   `--client-config PATH_TO_CONFIG.json`: Path to a JSON configuration file for client-specific mappings (passed to `fixarc`).
 *   `--farm`: Submits each `fixarc` process as a separate job to Deadline.
@@ -132,28 +132,28 @@ python path/to/fixarc/bin/fixarc-handler --project <PROJECT_NAME> ...
 
 ### `fixarc-handler` Examples
 
-The following examples demonstrate usage on different operating systems, using the hypothetical project "sandbox" located at `W:\\proj\\sandbox` (for Windows) or `/mnt/proj/sandbox` (for Linux/macOS), with an archive root of `W:\\proj\\sandbox\\delivery\\archive` or `/mnt/proj/sandbox/delivery/archive` respectively.
+The following examples demonstrate usage on different operating systems, using the hypothetical project "sandbox" located at `W:\proj\sandbox` (for Windows) or `/mnt/proj/sandbox` (for Linux/macOS), with an archive root of `W:\proj\sandbox\delivery\archive` or `/mnt/proj/sandbox/delivery/archive` respectively.
 
 #### Windows Examples
 
 **1. Archive the latest version of all published Nuke scripts for project "sandbox":**
 
-This command will search for published Nuke scripts under `W:\\proj\\sandbox\\sandbox\\shots\\...` (assuming `W:\\proj\\sandbox` is the base path) and archive the latest version of each found script to `W:\\proj\\sandbox\\delivery\\archive`.
+This command will search for published Nuke scripts under `W:\proj\sandbox\sandbox\shots\...` (assuming `W:\proj\sandbox` is the base path) and archive the latest version of each found script to `W:\proj\sandbox\delivery\archive`.
 
 ```bash
 fixarc-handler --project sandbox ^
-    --archive-root "W:\\proj\\sandbox\\delivery\\archive" ^
-    --base-path "W:\\proj\\sandbox"
+    --archive-root "W:\proj\sandbox\delivery\archive" ^
+    --base-path "W:\proj"
 ```
 
 **2. Archive the latest 3 versions of published Nuke scripts for episode "BOB_101" of project "sandbox":**
 
-This targets only scripts within the "BOB_101" episode structure (e.g., `W:\\proj\\sandbox\\sandbox\\shots\\BOB_101\\...`).
+This targets only scripts within the "BOB_101" episode structure (e.g., `W:\proj\sandbox\sandbox\shots\BOB_101\...`).
 
 ```bash
 fixarc-handler --project sandbox --episode BOB_101 ^
-    --archive-root "W:\\proj\\sandbox\\delivery\\archive" ^
-    --base-path "W:\\proj\\sandbox" ^
+    --archive-root "W:\proj\sandbox\delivery\archive" ^
+    --base-path "W:\proj" ^
     --max-versions 3
 ```
 
@@ -167,11 +167,11 @@ This example demonstrates:
 *   Assuming `fixarc-handler` is run via python directly from its location within the `fixarc` package.
 
 ```bash
-python C:\\Users\\robin.d\\Documents\\dev\\pipe\\fixarc\\bin\\fixarc-handler ^
+python C:\Users\robin.d\Documents\dev\pipe\fixarc\bin\fixarc-handler ^
     --project sandbox ^
     --shot BOB_101_002_030_CLN BOB_101_003_030_CLN ^
-    --archive-root "W:\\proj\\sandbox\\delivery\\archive" ^
-    --base-path "W:\\proj\\sandbox" ^
+    --archive-root "W:\proj\sandbox\delivery\archive" ^
+    --base-path "W:\proj" ^
     --max-versions 0 ^
     --farm ^
     --fixarc-options "--update-script --bake-gizmos --vendor FixFX"
@@ -182,9 +182,9 @@ Note: The `^` character is used for line continuation in Windows CMD. The paths 
 
 ```bash
 fixarc-handler --project sandbox --sequence BOB_101_00X ^
-    --archive-root "W:\\proj\\sandbox\\delivery\\archive" ^
-    --base-path "W:\\proj\\sandbox" ^
-    --client-config "W:\\proj\\sandbox\\config\\spt_config_v3.json" ^
+    --archive-root "W:\proj\sandbox\delivery\archive" ^
+    --base-path "W:\proj" ^
+    --client-config "W:\proj\sandbox\config\spt_config_v3.json" ^
     -vv
 ```
 This assumes a client configuration file exists at the specified path.
@@ -198,7 +198,7 @@ This command will search for published Nuke scripts under `/mnt/proj/sandbox/san
 ```bash
 fixarc-handler --project sandbox \\
     --archive-root /mnt/proj/sandbox/delivery/archive \\
-    --base-path /mnt/proj/sandbox
+    --base-path /mnt/proj
 ```
 
 **2. Archive the latest 3 versions of published Nuke scripts for episode "BOB_101" of project "sandbox":**
@@ -208,7 +208,7 @@ This targets only scripts within the "BOB_101" episode structure (e.g., `/mnt/pr
 ```bash
 fixarc-handler --project sandbox --episode BOB_101 \\
     --archive-root /mnt/proj/sandbox/delivery/archive \\
-    --base-path /mnt/proj/sandbox \\
+    --base-path /mnt/proj \\
     --max-versions 3
 ```
 
@@ -221,7 +221,7 @@ python /opt/fixarc/bin/fixarc-handler \\
     --project sandbox \\
     --shot BOB_101_002_030_CLN BOB_101_003_030_CLN \\
     --archive-root /mnt/proj/sandbox/delivery/archive \\
-    --base-path /mnt/proj/sandbox \\
+    --base-path /mnt/proj \\
     --max-versions 0 \\
     --farm \\
     --fixarc-options "--update-script --bake-gizmos --vendor FixFX"
@@ -233,14 +233,14 @@ Note: The `\\` character is used for line continuation in Bash/Shell. The paths 
 ```bash
 fixarc-handler --project sandbox --sequence BOB_101_00X \\
     --archive-root /mnt/proj/sandbox/delivery/archive \\
-    --base-path /mnt/proj/sandbox \\
+    --base-path /mnt/proj \\
     --client-config /mnt/proj/sandbox/config/spt_config_v3.json \\
     -vv
 ```
 
 **5. Archive all versions for episode "BOB_101" and submit to farm, relying on `FIXSTORE_DRIVE`:**
 
-This assumes the `FIXSTORE_DRIVE` environment variable is set (e.g., to `/mnt/proj`), from which `--base-path` (e.g. `/mnt/proj/sandbox`) would be inferred by the script if not explicitly provided.
+This assumes the `FIXSTORE_DRIVE` environment variable is set (e.g., to `/mnt/proj`), from which `--base-path` (e.g. `/mnt/proj`) would be inferred by the script if not explicitly provided.
 
 ```bash
 fixarc-handler --project sandbox --episode BOB_101 \\
@@ -255,7 +255,7 @@ fixarc-handler --project sandbox --episode BOB_101 \\
 fixarc-handler --project sandbox \\
     --shot BOB_101_002_020_CLN BOB_101_00X_010_WIG \\
     --archive-root /mnt/proj/sandbox/delivery/archive \\
-    --base-path /mnt/proj/sandbox \\
+    --base-path /mnt/proj \\
     --max-versions 1 \\
     -vv
 ```
