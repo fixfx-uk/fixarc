@@ -587,19 +587,18 @@ def main():
 
             # --- Execute fixarc (Locally or via Farm) ---
             if not args.farm: # Local execution
-                log.info(f"Executing 'fixarc' locally for {script_basename}...") # Indicate start of execution
-                # The actual command string will be logged by the debug log of shlex.split in subprocess.run below if needed
+                log.info(f"Executing 'fixarc' locally for {script_basename}...") 
                 try:
-                    process = subprocess.run(base_cmd_args, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
-                    # No exception means success
+                    # Let the subprocess print directly to the console for live progress
+                    process = subprocess.run(base_cmd_args, check=True, text=True, encoding='utf-8')
                     log.info(f"Successfully archived: {script_basename}")
-                    if process.stdout: log.debug(f"fixarc stdout for {script_basename}:\n{process.stdout.strip()}")
-                    if process.stderr: log.debug(f"fixarc stderr for {script_basename}:\n{process.stderr.strip()}")
+                    # process.stdout and process.stderr will be None, as output goes to console
                     success_count += 1
                 except subprocess.CalledProcessError as e:
+                    # If the subprocess fails, its output (if any) would have gone to console.
+                    # We can still log the return code.
                     log.error(f"'fixarc' command FAILED for: {script_basename} (Exit code: {e.returncode})")
-                    if e.stdout: log.error(f"fixarc stdout:\n{e.stdout.strip()}")
-                    if e.stderr: log.error(f"fixarc stderr:\n{e.stderr.strip()}")
+                    # e.stdout and e.stderr will be None if output wasn't captured.
                     fail_count += 1
                 except FileNotFoundError: 
                     log.error(f"Critical error: 'fixarc' command not found at {fixarc_cmd_path} during execution attempt. Halting for {script_basename}.")
@@ -617,8 +616,7 @@ def main():
                     job_name_sanitized = f"fixarc_job_{script_basename.replace('.', '_')}" # Fallback if sanitization results in empty
                 
                 # Create filenames for Deadline job info files.
-                job_file_basename = job_name_sanitized.replace(':', '_').replace(' ', '_').replace('\\', '_').replace('/', '_')
-                job_info_filename = f"{job_file_basename}.job"
+                job_info_filename = f"{job_name_sanitized}.job"
                 # plugin_info_filename = f"{job_file_basename}.plugin" # Not used in this basic setup
 
                 job_info_file_path = os.path.join(main_temp_dir_for_all_jobs, job_info_filename)

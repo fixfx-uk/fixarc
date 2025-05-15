@@ -67,13 +67,19 @@ READ_NODE_CLASSES = frozenset([
     "Axis", "Axis2", "Axis3", "OCIOFileTransform", "Vectorfield",
     "GenerateLUT", "BlinkScript", "ParticleCache", "PointCloudGenerator", "STMap",
 ])
-# Placeholder for category, mirroring simplified mapping logic below
 ELEMENTS_REL = 'elements'
 
 # Constants for relative paths
 PROJECT_REL = 'project'
 SCRIPTS_REL = 'scripts'
 NUKE_REL = 'nuke'
+
+# --- SPT Directory Format Constants (mirroring fixarc.constants) ---
+VENDOR_DIR = "{vendor}"
+SHOW_DIR = "{show}"
+EPISODE_DIR = "{episode}"
+SHOT_DIR = "{episode}_{sequence}_{shot}_{tag}" # Key constant for shot directory naming
+PROJECT_FILES_REL = "project/nuke" # For where .nk scripts are typically stored in archive
 
 # --- Helper Functions (Internal to this script) ---
 
@@ -576,24 +582,26 @@ def repath_script_knobs(
     for node_knob, data in dependency_info.items():
         orig_eval = data.get("evaluated_path")
         if orig_eval and not data.get("error"):  # Only map valid, evaluated paths
-            # Simulate mapping using standard SPT structure
             try:
-                # Use consistent approach for all file paths
                 filename = Path(orig_eval).name
-                # Use elements as default category
-                category = ELEMENTS_REL
-                # Construct standard path
-                base = Path(archive_root) / temp_metadata['vendor'] / temp_metadata['show']
-                base /= temp_metadata['episode'] / temp_metadata['shot']
-                dest_path = base / category / filename
+                # Use ELEMENTS_REL for the category for dependent files (non-script files)
+                # The final script itself is handled by final_script_archive_path which uses PROJECT_FILES_REL
+                category_for_dependency = ELEMENTS_REL 
+
+                # Use the new helper to construct the base directory for this category
+                spt_category_dir = _get_spt_path(
+                    archive_root, # archive_root from main args
+                    temp_metadata, 
+                    category_for_dependency
+                )
+                dest_path = spt_category_dir / filename
                 
-                # Store with normalized paths
-                dependency_map_for_repath[orig_eval] = str(dest_path).replace("\\","/")
-                _log_print("debug", f"Mapped '{orig_eval}' → '{dependency_map_for_repath[orig_eval]}'")
+                dependency_map_for_repath[orig_eval] = str(dest_path).replace("\\\\", "/")
+                _log_print("debug", f"Mapped for repath: '{orig_eval}' → '{dependency_map_for_repath[orig_eval]}'")
             except Exception as map_e:
                 _log_print("error", f"Could not calculate destination for repathing '{orig_eval}': {map_e}")
 
-    # Now repath the knobs in memory
+    # Now repath the knobs in memory using the calculated map
     repath_count = _repath_nodes(nodes, dependency_map_for_repath, final_script_path)
     _log_print("info", f"--- Finished Optional Step: Repath Script ({repath_count} paths updated) ---")
     
@@ -733,27 +741,26 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
     shot_code = '_'.join(filter(None, shot_code_parts)) 
     _log_print("debug", f"Constructed shot code for path splitting: {shot_code}")
 
-    # Regex for the Comp/work/user/images pattern
+    # Regex for the Comp/work/images pattern
     comp_work_images_re = re.compile(r"Comp/work/[^/]+/images/(.*)", re.IGNORECASE)
 
-    # Base archive path construction (common part)
+    # Base archive path construction for elements using the helper
     try:
-        archive_root_str = str(archive_root)
-        vendor_str = str(temp_metadata['vendor'])
-        show_str = str(temp_metadata['show'])
-        episode_str = str(temp_metadata['episode'])
-        shot_str = str(temp_metadata['shot']) # Using the short shot number here
-        
-        # Build the base path using Path objects (VENDOR/SHOW/EPISODE/SHOT)
-        base_archive_path = Path(archive_root_str) / vendor_str / show_str / episode_str / shot_str / ELEMENTS_REL
-    except KeyError as ke:
-         _log_print("error", f"Cannot build base archive path: Missing metadata key '{ke}'. Metadata: {temp_metadata}")
+        # Get the base directory for elements using the helper function
+        # This directory will be like: archive_root/vendor/show/episode/SHOT_DIR_formatted/elements
+        elements_category_archive_path = _get_spt_path(
+            str(archive_root), # Ensure it's a string
+            temp_metadata,
+            ELEMENTS_REL # Use the predefined constant for elements category
+        )
+    except (ConfigurationError, ArchiverError) as path_e:
+         _log_print("error", f"Cannot build base archive path for elements: {path_e}. Metadata: {temp_metadata}")
          return {}
-    except Exception as base_path_e:
-         _log_print("error", f"Error building base archive path: {base_path_e}")
+    except Exception as base_path_e: # Catch any other unexpected error
+         _log_print("error", f"Unexpected error building base archive path for elements: {base_path_e}")
          return {}
          
-    _log_print("debug", f"Base archive path for elements: {base_archive_path}")
+    _log_print("debug", f"Base archive path for elements (via helper): {elements_category_archive_path}")
 
     for node_knob, data in dependency_info.items():
         original_path = data.get("original_path")
@@ -806,7 +813,8 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
             # Construct the final destination path
             # Ensure the relative part doesn't start with / if base_archive_path handled it
             final_relative_part = relative_elements_path_str.lstrip('/') 
-            dest_path = base_archive_path / final_relative_part
+            # Prepend the consistent elements_category_archive_path
+            dest_path = elements_category_archive_path / final_relative_part
 
             # Convert final path to string with forward slashes
             dest_path_str = str(dest_path).replace("\\\\", "/")
@@ -819,6 +827,55 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
             _log_print("debug", f"Exception details: {traceback.format_exc()}")
 
     return dependencies_to_copy
+
+def _get_spt_path(
+    archive_root_str: str,
+    metadata_dict: Dict[str, Any],
+    relative_category_path_str: str
+) -> Path:
+    """
+    Constructs SPT path within _nuke_executor.py, mirroring archive_utils.py logic.
+    Structure: {archive_root}/{vendor}/{show}/{episode}/{SHOT_DIR_fmt}/{relative_category_path}
+    Assumes metadata_dict contains 'vendor', 'show', 'episode', 'sequence', 'shot', 'tag'.
+    Does not perform deep sanitization like ensure_ltfs_safe as that's external.
+    """
+    try:
+        # --- Extract metadata (caller should ensure keys exist) ---
+        vendor = str(metadata_dict['vendor'])
+        show = str(metadata_dict['show'])
+        episode = str(metadata_dict['episode'])
+        sequence = str(metadata_dict['sequence'])
+        shot_num = str(metadata_dict['shot'])
+        tag = str(metadata_dict['tag'])
+
+        # --- Format directory components using locally defined constants ---
+        vendor_fmt = VENDOR_DIR.format(vendor=vendor)
+        show_fmt = SHOW_DIR.format(show=show)
+        episode_fmt = EPISODE_DIR.format(episode=episode)
+        # Use the SHOT_DIR constant for the shot-level directory name
+        shot_dir_fmt = SHOT_DIR.format(episode=episode, sequence=sequence, shot=shot_num, tag=tag)
+
+        # --- Construct Path ---
+        # Path: archive_root / vendor / show / episode / formatted_shot_dir / category
+        base_shot_path = Path(archive_root_str) / vendor_fmt / show_fmt / episode_fmt / shot_dir_fmt
+        
+        final_category_path = base_shot_path
+        if relative_category_path_str:
+            # Normalize slashes for the relative category path and remove leading/trailing
+            clean_relative_path = relative_category_path_str.replace("\\\\", "/").strip('/')
+            if '..' in clean_relative_path.split('/'):
+                 _log_print("warning", f"Relative category path '{relative_category_path_str}' for SPT construction contains '..'. This might be unsafe.")
+            final_category_path = base_shot_path / clean_relative_path
+        
+        _log_print("debug", f"Constructed SPT category path in Nuke Executor: {final_category_path}")
+        return final_category_path
+
+    except KeyError as e:
+        _log_print("error", f"Missing metadata key for SPT path construction in Nuke Executor: {e}. Metadata: {metadata_dict}")
+        raise ConfigurationError(f"Missing metadata key for SPT path construction in Nuke Executor: {e}")
+    except Exception as e:
+        _log_print("error", f"Unexpected error constructing SPT path in Nuke Executor: {e}")
+        raise ArchiverError(f"Unexpected error constructing SPT path in Nuke Executor: {e}")
 
 def run_nuke_tasks(args: argparse.Namespace) -> Dict[str, Any]:
     """

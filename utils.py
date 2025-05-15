@@ -389,26 +389,26 @@ def copy_file_or_sequence(source: str, dest: str, frame_range: Optional[Tuple[in
                 except OSError as e:
                     log.error(f"Failed to create destination directory '{dest_dir}': {e}")
                     return [] # Cannot copy if destination dir fails
-
+            if dry_run:
+                print("[DRY RUN] Copying sequence:")
             # Copy each frame file
             for src, dst in zip(source_files, dest_files):
+                src_path_obj = Path(src)
+                if not src_path_obj.is_file():
+                    # Log as warning, maybe some frames are missing intentionally?
+                    log.warning(f"Source frame missing: {src}")
+                    continue # Skip this frame
                 if dry_run:
-                    log.info(f"[DRY RUN] Would copy frame: {src} -> {dst}")
+                    log.info(f" {src} -> {dst}")
                     copied_pairs.append((src, dst))
-                    print(".", end="", flush=True) # Progress per frame (dry run)
                 else:
-                    src_path_obj = Path(src)
-                    if not src_path_obj.is_file():
-                        # Log as warning, maybe some frames are missing intentionally?
-                        log.warning(f"Source frame missing: {src}")
-                        continue # Skip this frame
                     try:
                         shutil.copy2(src, dst)
                         copied_pairs.append((src, dst))
-                        print(".", end="", flush=True) # Progress per frame
                     except Exception as e:
                         log.error(f"Failed to copy frame {src} -> {dst}: {e}")
-                        # Continue trying other frames
+                print(".", end="", flush=True) # Progress per frame
+            print()
         else:
             # Copy single file
             log.debug(f"Copying single file: {norm_source} -> {norm_dest}")
@@ -432,11 +432,11 @@ def copy_file_or_sequence(source: str, dest: str, frame_range: Optional[Tuple[in
                     shutil.copy2(norm_source, norm_dest)
                     copied_pairs.append((norm_source, norm_dest))
                     print(".", end="", flush=True) # Progress for single file copy
+                    print()
                     log.debug(f"Successfully copied single file: {norm_source} to {norm_dest}")
                 except Exception as e:
                     log.error(f"Failed to copy {norm_source} -> {norm_dest}: {e}")
                     return [] # Fail if single file copy fails
-
     except Exception as e:
         log.error(f"Unexpected error in copy_file_or_sequence for {norm_source} -> {norm_dest}: {e}")
         return [] # Return empty on unexpected error
