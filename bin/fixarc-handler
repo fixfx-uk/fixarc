@@ -297,8 +297,8 @@ def create_parser():
     """Creates and configures the argparse.ArgumentParser for the script.
 
     Defines all command-line arguments, their types, help messages, and default values.
-    A mutually exclusive group ensures that only one primary mode of operation
-    (project, episode, sequence, or shot) can be active.
+    A mutually exclusive group allows specifying a scope (episode, sequence, shot)
+    within the project. If no scope is given, it defaults to the entire project.
 
     Returns:
         argparse.ArgumentParser: The configured argument parser.
@@ -307,29 +307,29 @@ def create_parser():
         description="Handles archiving Nuke scripts for projects, sequences, or shots using 'fixarc'.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter # Shows default values in --help
     )
-    # --- Mutually Exclusive Mode Group ---
-    # The user must specify one of these modes.
-    mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument(
-        "--project", type=str, dest="project_name_mode", metavar="PROJECT_NAME",
-        help="Archive all published Nuke scripts in the specified project's 'shots' scope. "
-             "This argument also serves as the required project context when using "
-             "--episode, --sequence, or --shot flags."
+
+    # --- Project Context (Now a general required argument) ---
+    parser.add_argument(
+        "--project", type=str, dest="project_name_arg", metavar="PROJECT_NAME", required=True,
+        help="The name of the project. This is always required and provides context "
+             "for other scope arguments like --episode, --sequence, or --shot, or for processing the whole project."
     )
+
+    # --- Mutually Exclusive Mode Group (Optional: if none given, defaults to whole project) ---
+    # User can optionally narrow down the scope to episode, sequence, or shot.
+    # If none are chosen, the script will operate on the entire project specified by --project.
+    mode_group = parser.add_mutually_exclusive_group(required=False)
     mode_group.add_argument(
         "--episode", nargs='+', metavar="EPISODE_NAME",
-        help="Archive published Nuke scripts in the specified episode(s). "
-             "Requires --project <PROJECT_NAME> to be specified for context."
+        help="Archive published Nuke scripts in the specified episode(s) of the given --project."
     )
     mode_group.add_argument(
         "--sequence", nargs='+', metavar="SEQUENCE_NAME",
-        help="Archive published Nuke scripts in the specified sequence(s). "
-             "Requires --project <PROJECT_NAME> to be specified for context."
+        help="Archive published Nuke scripts in the specified sequence(s) of the given --project."
     )
     mode_group.add_argument(
         "--shot", nargs='+', metavar="SHOT_NAME",
-        help="Archive published Nuke scripts in the specified shot(s). "
-             "Requires --project <PROJECT_NAME> to be specified for context."
+        help="Archive published Nuke scripts in the specified shot(s) of the given --project."
     )
 
     # --- Required Arguments ---
@@ -383,12 +383,9 @@ def main():
     # Configure logging level based on verbosity flags.
     # If using fixfx.log, its level is the base, but this script can increase its own verbosity.
     if args.verbose == 0:
-        # Default to INFO if no -v flags, unless fixfx.log is more verbose.
-        # The actual level check against fixfx.log's level isn't done here,
-        # log.setLevel will handle it. This sets the handler's logger specifically.
         log.setLevel(logging.INFO)
     elif args.verbose == 1:
-        log.setLevel(logging.INFO) 
+        log.setLevel(logging.INFO)
     elif args.verbose >= 2:
         log.setLevel(logging.DEBUG)
 
@@ -400,14 +397,13 @@ def main():
             if log is fixfx_log_check: # Verify it's the same logger instance
                  using_fixfx_log = True
         except ImportError:
-             pass # Should not happen if initial try/except for log worked.
+             pass
 
     if using_fixfx_log:
         log.info("fixarc-handler: Using logger from 'fixfx' package.")
     else:
         log.info("fixarc-handler: Using internal basic logger ('fixarc.handler').")
-        # Remind user if basic logging is active and not highly verbose, as fixfx.log might be preferred.
-        if log.level > logging.WARNING: # e.g. if log.level is INFO (20)
+        if log.level > logging.WARNING:
             log.warning("fixarc-handler: (Reminder) Could not import 'log' from 'fixfx'. Basic logging in use.")
 
     log.debug(f"fixarc-handler: Effective logging level set to {logging.getLevelName(log.level)}.")
@@ -415,66 +411,36 @@ def main():
 
     # --- Locate Essential Commands ---
     current_script_dir = os.path.dirname(os.path.realpath(__file__))
-    # `fixarc` command is essential. Try to find it next to this script as a fallback.
     fixarc_cmd_path = get_command_path("fixarc", is_essential=True, relative_fallback_search_dirs=[current_script_dir])
     log.info(f"Using 'fixarc' command: {fixarc_cmd_path}")
 
     deadline_cmd_path = None
     if args.farm:
-        # `deadlinecommand` is essential only if --farm mode is active.
         deadline_cmd_path = get_command_path("deadlinecommand", is_essential=True)
         log.info(f"Using 'deadlinecommand': {deadline_cmd_path}")
 
     # --- Determine Operating Mode and Target Names ---
-    mode = None # Will be one of "project", "episode", "sequence", "shot"
-    project_name = None # The overarching project context
+    project_name = args.project_name_arg # Get project name from the general --project argument
+
+    mode = "project" # Default mode: process the whole project
     names_to_process = [] # List of specific episodes, sequences, or shots
 
-    # The argparse mutually exclusive group ensures only one of these (project, episode, sequence, shot)
-    # is set as the *primary* mode argument.
-    # However, --project can also serve as a context for other modes.
-
-    if args.project_name_mode:
-        project_name = args.project_name_mode # Always take project name if --project is given
-        # If --project is the *only* mode flag given, then mode is "project"
-        if not (args.episode or args.sequence or args.shot):
-            mode = "project"
-    
-    # If other mode flags are given, they take precedence for 'mode',
-    # and --project (if given) provides the 'project_name' context.
     if args.episode:
-        if mode == "project": # This means --project was the only mode flag initially.
-            log.debug(f"--project '{project_name}' now serving as context for --episode mode.")
         mode = "episode"
         names_to_process = args.episode
-        if not project_name: # Ensure project context was provided if --project wasn't the primary mode
-            parser.error("--project <PROJECT_NAME> is required as context when using --episode.")
     elif args.sequence:
-        if mode == "project":
-            log.debug(f"--project '{project_name}' now serving as context for --sequence mode.")
         mode = "sequence"
         names_to_process = args.sequence
-        if not project_name:
-            parser.error("--project <PROJECT_NAME> is required as context when using --sequence.")
     elif args.shot:
-        if mode == "project":
-            log.debug(f"--project '{project_name}' now serving as context for --shot mode.")
         mode = "shot"
         names_to_process = args.shot
-        if not project_name:
-            parser.error("--project <PROJECT_NAME> is required as context when using --shot.")
+    # If none of the above (episode, sequence, shot) are specified, 
+    # the mode remains "project" and names_to_process remains empty,
+    # indicating processing for the entire project_name.
     
-    # Final check, should be redundant due to argparse 'required=True' on the group
-    # and the logic above, but good for safety.
-    if not mode:
-        parser.error("A mode (--project, --episode, --sequence, or --shot) must be specified and parsed.")
-    if not project_name: # project_name must be set for all modes.
-         parser.error(f"Internal error: project_name not set for mode '{mode}'. This should not happen.")
-
-
     log.info(f"Operating Mode: {mode}")
     log.info(f"Project Name: {project_name}")
-    if names_to_process: # Only log if there are specific names for episode, sequence, or shot mode
+    if names_to_process:
         log.info(f"Names to process: {names_to_process}")
     log.info(f"Archive Root: {args.archive_root}")
 
