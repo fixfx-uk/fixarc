@@ -503,21 +503,53 @@ def copy_files_robustly(
 
         try:
             # --- Build Command (Robocopy/Rsync) ---
-            if fixenv.OS == fixenv.OS_WIN and not is_seq:
-                 # Use robocopy for single files (less efficient but robust)
+            if is_seq:
+                source_sequence_dir = Path(norm_source).parent
+                dest_grandparent_dir = Path(norm_dest).parent.parent # Directory where the sequence folder will be placed
+                # The actual destination for the sequence dir will be dest_grandparent_dir / source_sequence_dir.name
+                final_dest_sequence_dir = dest_grandparent_dir / source_sequence_dir.name
+
+                if not source_sequence_dir.is_dir():
+                    log.error(f"Source sequence directory not found: {source_sequence_dir}")
+                    use_shutil_fallback = True # Or mark as copy_success = False directly
+                    copy_success = False # Ensure this path leads to failure count
+                else:
+                    if fixenv.OS == fixenv.OS_WIN:
+                        command = [
+                            'robocopy', 
+                            str(source_sequence_dir), 
+                            str(final_dest_sequence_dir), 
+                            '/E', '/COPY:DAT', '/R:1', '/W:1', '/NJH', '/NJS', '/NP', '/NDL'
+                        ]
+                        # Add /CREATE if dest exists to ensure it overlays correctly? Or /MIR for sync?
+                        # /E is usually sufficient for a one-way copy into a new/empty target.
+                        copy_command = command
+                    elif fixenv.OS == fixenv.OS_LIN or fixenv.OS == fixenv.OS_MAC:
+                        # rsync -rtq source_dir/ dest_dir/ (copies contents)
+                        # rsync -rtq source_dir dest_parent_dir/ (copies source_dir into dest_parent_dir)
+                        command = [
+                            'rsync', '-rtq', 
+                            str(source_sequence_dir), 
+                            str(dest_grandparent_dir) + '/' # Ensure trailing slash for parent dir
+                        ]
+                        copy_command = command
+                    else:
+                        log.debug(f"Using shutil fallback for sequence on unsupported OS: {norm_source}")
+                        use_shutil_fallback = True
+            
+            # Original logic for single files
+            elif fixenv.OS == fixenv.OS_WIN and not is_seq: # Explicitly not is_seq
                  src_dir = str(Path(norm_source).parent)
                  src_file = Path(norm_source).name
                  dest_dir = str(Path(norm_dest).parent)
                  command = ['robocopy', src_dir, dest_dir, src_file, '/COPY:DAT', '/R:2', '/W:3', '/NJH', '/NJS', '/NP', '/NDL']
-                 # Check if destination exists to decide on /IS (include same files/overwrite)
                  if not dry_run and Path(norm_dest).exists(): command.append('/IS')
                  copy_command = command
-            elif (fixenv.OS == fixenv.OS_LIN or fixenv.OS == fixenv.OS_MAC) and not is_seq:
-                 # Use rsync for single files
-                 command = ['rsync', '-t', '-q', norm_source, norm_dest] # -t preserves times, -q quiet
+            elif (fixenv.OS == fixenv.OS_LIN or fixenv.OS == fixenv.OS_MAC) and not is_seq: # Explicitly not is_seq
+                 command = ['rsync', '-rtq', norm_source, norm_dest] 
                  copy_command = command
             else:
-                 # Use shutil fallback for sequences or non-Win/Lin/Mac OS
+                 # Use shutil fallback for sequences on unsupported OS (already handled), or single files on unsupported OS
                  log.debug(f"Using shutil fallback for: {norm_source}")
                  use_shutil_fallback = True
 
@@ -525,15 +557,18 @@ def copy_files_robustly(
             if copy_command and not use_shutil_fallback:
                  if dry_run:
                       log.info(f"[DRY RUN] Would execute: {' '.join(copy_command)}")
-                      copy_success = True # Assume success for dry run command simulation
+                      copy_success = True 
                  else:
                       log.info(f"Executing copy: {' '.join(copy_command)}")
-                      # Ensure destination directory exists before running command
-                      Path(norm_dest).parent.mkdir(parents=True, exist_ok=True)
+                      # For directory copies, ensure the grandparent_dest exists if rsync/robocopy don't create it deep.
+                      # Robocopy creates the final_dest_sequence_dir. Rsync creates its target if parent exists.
+                      if is_seq:
+                          dest_grandparent_dir.mkdir(parents=True, exist_ok=True)
+                      else:
+                          Path(norm_dest).parent.mkdir(parents=True, exist_ok=True)
 
                       copy_process = subprocess.run(copy_command, capture_output=True, text=True, check=False, encoding='utf-8', errors='replace')
-                      # Robocopy success codes are <= 1 (or <= 3 if /IS used? Check docs). Rsync is 0.
-                      success_codes = {0, 1} if fixenv.OS == fixenv.OS_WIN else {0}
+                      success_codes = {0, 1, 2, 3} if fixenv.OS == fixenv.OS_WIN else {0} # Robocopy success codes can be > 1
                       if copy_process.returncode not in success_codes:
                            log.error(f"Copy command failed for '{norm_source}' (Code: {copy_process.returncode}):")
                            stdout = copy_process.stdout.strip()
@@ -543,31 +578,50 @@ def copy_files_robustly(
                            copy_success = False
                       else:
                            log.info(f"Successfully copied '{norm_source}' using external tool.")
-                           print(".", end="", flush=True)
-                           dots_printed = True
+                           if not is_seq: # Only print dot for single files here, sequence copy is one op
+                               print(".", end="", flush=True)
+                               dots_printed = True
+                           else: # For sequences, we indicate one major operation
+                               log.info(f"Sequence directory operation for {norm_source} completed.")
+                               # We might want to count actual files copied if robocopy/rsync gives us that.
+                               # For now, assume 1 op = success for the entry.
+                               # If is_seq, num_files_in_op will be set by counting later if needed, or assumed 1 for the entry.
+                               pass 
                            copy_success = True
-            else:
-                 # Use Shutil Fallback
-                 # Frame range determination happens inside copy_file_or_sequence now
-                 # copy_file_or_sequence will print its own dots
-                 original_stdout = sys.stdout # Keep track of original stdout
-                 # Redirect stdout for the duration of this call if we want to capture dots, but for now, let it print directly
-                 
+            elif use_shutil_fallback: # Corrected indentation for this block
+                 log.debug(f"Proceeding with shutil fallback for: {norm_source}")
                  copied_pairs = copy_file_or_sequence(norm_source, norm_dest, frame_range=None, dry_run=dry_run)
-                 
-                 if copied_pairs: # Function returns list of successful copies
+                 if copied_pairs:
                      copy_success = True
-                     num_files_in_op = len(copied_pairs) if is_seq else 1
-                     # If copy_file_or_sequence printed dots, ensure our flag is set
-                     if num_files_in_op > 0:
-                         dots_printed = True 
+                     num_files_in_op = len(copied_pairs)
+                     if num_files_in_op > 0: dots_printed = True
                  else:
-                     # copy_file_or_sequence logs errors internally
                      log.error(f"Shutil copy failed or resulted in zero files for: {norm_source}")
                      copy_success = False
+            # Add an else here to catch cases where no command was built and not using shutil (e.g. sequence src dir missing)
+            elif not copy_command and not use_shutil_fallback and is_seq and not copy_success:
+                log.error(f"Skipping copy for sequence {norm_source} due to earlier error (e.g. source dir missing).")
+                # copy_success is already False
 
             # --- Update Counts ---
             if copy_success:
+                # For sequences copied with robocopy/rsync, num_files_in_op is 1 (one operation)
+                # unless we parse output to get actual file count.
+                # Shutil fallback sets num_files_in_op based on actual files copied.
+                if not use_shutil_fallback and is_seq: 
+                    # Heuristic: if it's a sequence and copied by external tool, 
+                    # try to count files for a more accurate success_count.
+                    # This is a placeholder - proper counting requires parsing output or listing dest_dir.
+                    try:
+                        num_files_in_op = len(list(Path(final_dest_sequence_dir).rglob('*')))
+                        log.info(f"Counted {num_files_in_op} files in destination for sequence {source_sequence_dir.name}")
+                    except Exception as e:
+                        log.warning(f"Could not count files in destination for sequence {source_sequence_dir.name}, assuming 1 op success. Error: {e}")
+                        num_files_in_op = 1 # Fallback if counting fails
+                elif use_shutil_fallback: # num_files_in_op is already set by shutil block
+                    pass 
+                else: # Single file copy
+                    num_files_in_op = 1
                 success_count += num_files_in_op
             else:
                 # Estimate failure count: assume 1 for single file or guess sequence length?
