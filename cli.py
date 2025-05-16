@@ -109,7 +109,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-v", "--verbose",
         action="count",
-        default=2,
+        default=1,
         help="Increase logging verbosity (-v for INFO, -vv for DEBUG)."
     )
     parser.add_argument(
