@@ -24,12 +24,12 @@ import traceback
 import argparse
 from pathlib import Path # Use pathlib for path manipulation within Nuke
 from typing import Dict, List, Set, Optional, Tuple, Any # Use standard typing
-import tempfile
 import logging
 import re # Added for regex matching
+from fixenv import normalize_path # <-- ADD THIS IMPORT
 
 # Set up logging to stderr for the wrapper to capture
-logging.basicConfig(level=logging.DEBUG,
+logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s [%(levelname)s] %(message)s',
                     stream=sys.stderr)
 log = logging.getLogger(__name__)
@@ -86,7 +86,6 @@ PROJECT_FILES_REL = "project/nuke" # For where .nk scripts are typically stored 
 def _log_print(level: str, message: str) -> None:
     """Simple print-based logging mimic for Nuke environment."""
     # Output format matches basic logger for parsing by main process if needed
-    timestamp = traceback.extract_stack()[-2].name # Function name isn't useful here
     print(f"[{level.upper():<7}] [NukeExecutor] {message}")
 
 def _is_valid_writefix(node: nuke.Node) -> bool:
@@ -265,7 +264,7 @@ def _collect_dependency_paths(nodes: Set[nuke.Node]) -> Dict[str, Dict[str, Any]
                     _log_print("warning", f"Cannot resolve relative path '{evaluated_path}' for '{node_name}.{knob_name}' as script directory is unavailable.")
 
                 # Normalize slashes
-                evaluated_path = evaluated_path.replace("\\", "/")
+                evaluated_path = normalize_path(evaluated_path)
 
             except Exception as e:
                 error_msg = f"Error evaluating '{knob_name}' for '{node_name}': {e}"
@@ -318,8 +317,6 @@ def _bake_gizmos(nodes_to_check: Set[nuke.Node]) -> Tuple[int, Set[nuke.Node]]:
         if not can_be_baked: continue
 
         is_gizmo_file_based = node.knob('gizmo_file') is not None
-        is_likely_native = node_class in native_plugins
-
         # --- Determine if baking is needed ---
         should_bake = False
         if is_gizmo_file_based:
@@ -370,20 +367,20 @@ def _bake_gizmos(nodes_to_check: Set[nuke.Node]) -> Tuple[int, Set[nuke.Node]]:
 def _calculate_relative_path_nuke(source_script_abs: str, target_dependency_abs: str) -> str:
     """Calculates relative path within Nuke env, falling back to absolute."""
     try:
-        norm_script_path = Path(str(source_script_abs).replace("\\", "/"))
-        norm_target_path = Path(str(target_dependency_abs).replace("\\", "/"))
+        norm_script_path = Path(normalize_path(str(source_script_abs)))
+        norm_target_path = Path(normalize_path(str(target_dependency_abs)))
         source_dir = norm_script_path.parent
         # Use os.path.relpath for cross-drive compatibility if needed
         relative = os.path.relpath(norm_target_path, source_dir)
-        nuke_relative_path = relative.replace("\\", "/")
+        nuke_relative_path = normalize_path(relative)
         _log_print("debug", f"Calculated relative path: '{nuke_relative_path}' (from '{source_dir}' to '{norm_target_path}')")
         return nuke_relative_path
     except ValueError as e: # Handles different drives on Windows
-        abs_target_nuke = str(target_dependency_abs).replace("\\", "/")
+        abs_target_nuke = normalize_path(str(target_dependency_abs))
         _log_print("warning", f"Could not make relative path ('{source_script_abs}' -> '{target_dependency_abs}'): {e}. Using absolute: {abs_target_nuke}")
         return abs_target_nuke
     except Exception as e:
-        abs_target_nuke = str(target_dependency_abs).replace("\\", "/")
+        abs_target_nuke = normalize_path(str(target_dependency_abs))
         _log_print("error", f"Unexpected error calculating relative path ('{source_script_abs}' -> '{target_dependency_abs}'): {e}. Using absolute: {abs_target_nuke}")
         return abs_target_nuke
 
@@ -446,7 +443,7 @@ def _repath_nodes(
                 else:
                      current_eval_path = current_eval_path_raw
 
-                current_eval_path = current_eval_path.replace("\\", "/")
+                current_eval_path = normalize_path(current_eval_path)
 
                 # Check if this evaluated path is one we archived
                 if current_eval_path in dependency_map:
@@ -596,7 +593,7 @@ def repath_script_knobs(
                 )
                 dest_path = spt_category_dir / filename
                 
-                dependency_map_for_repath[orig_eval] = str(dest_path).replace("\\\\", "/")
+                dependency_map_for_repath[orig_eval] = normalize_path(str(dest_path))
                 _log_print("debug", f"Mapped for repath: '{orig_eval}' → '{dependency_map_for_repath[orig_eval]}'")
             except Exception as map_e:
                 _log_print("error", f"Could not calculate destination for repathing '{orig_eval}': {map_e}")
@@ -720,111 +717,173 @@ def save_pruned_script(nodes: Set[nuke.Node], final_script_path: str, archive_ro
 def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_root: str, metadata_dict: Dict[str, Any]) -> Dict[str, str]:
     """
     Generates the final dependency map for copying files.
-    Constructs archive paths preserving relative structure after the shot folder.
+    Constructs archive paths preserving relative structure after the shot folder,
+    and special handling for 'assets' paths and Write/WriteFix outputs.
     """
     dependencies_to_copy = {}
     _log_print("debug", "Generating final dependency map for copying...")
     temp_metadata = metadata_dict
-    # Construct the expected shot code pattern (e.g., BOB_101_00X_010_WIG)
-    # Use metadata which should be reliable
+    
     shot_code_parts = [
         temp_metadata.get('episode'),
         temp_metadata.get('sequence'),
         temp_metadata.get('shot'),
-        temp_metadata.get('tag') # Assuming 'tag' is part of the shot code dir name
+        temp_metadata.get('tag')
     ]
-    if not all(shot_code_parts[:3]): # Episode, Sequence, Shot are essential
+    if not all(shot_code_parts[:3]):
         _log_print("error", "Cannot construct shot code: Missing episode, sequence, or shot in metadata.")
         return {}
-        
-    # Filter out None or empty parts before joining
-    shot_code = '_'.join(filter(None, shot_code_parts)) 
+    shot_code = '_'.join(filter(None, shot_code_parts))
     _log_print("debug", f"Constructed shot code for path splitting: {shot_code}")
 
-    # Regex for the Comp/work/images pattern
     comp_work_images_re = re.compile(r"Comp/work/[^/]+/images/(.*)", re.IGNORECASE)
 
-    # Base archive path construction for elements using the helper
     try:
-        # Get the base directory for elements using the helper function
-        # This directory will be like: archive_root/vendor/show/episode/SHOT_DIR_formatted/elements
-        elements_category_archive_path = _get_spt_path(
-            str(archive_root), # Ensure it's a string
+        # Get base paths for different categories
+        base_spt_elements_path = _get_spt_path(
+            str(archive_root),
             temp_metadata,
-            ELEMENTS_REL # Use the predefined constant for elements category
+            ELEMENTS_REL 
+        )
+        base_spt_images_path = _get_spt_path(
+            str(archive_root),
+            temp_metadata,
+            "images"  # New category for Write/WriteFix outputs
         )
     except (ConfigurationError, ArchiverError) as path_e:
-         _log_print("error", f"Cannot build base archive path for elements: {path_e}. Metadata: {temp_metadata}")
+         _log_print("error", f"Cannot build base archive paths: {path_e}. Metadata: {temp_metadata}")
          return {}
-    except Exception as base_path_e: # Catch any other unexpected error
-         _log_print("error", f"Unexpected error building base archive path for elements: {base_path_e}")
+    except Exception as base_path_e:
+         _log_print("error", f"Unexpected error building base archive paths: {base_path_e}")
          return {}
          
-    _log_print("debug", f"Base archive path for elements (via helper): {elements_category_archive_path}")
+    _log_print("debug", f"Base SPT elements category path: {base_spt_elements_path}")
+    _log_print("debug", f"Base SPT images category path: {base_spt_images_path}")
 
     for node_knob, data in dependency_info.items():
-        original_path = data.get("original_path")
-        if not original_path or data.get("error"):
+        original_path_str = data.get("original_path")
+        if not original_path_str or data.get("error"):
             _log_print("debug", f"Skipping mapping for {node_knob}: No original path or error encountered.")
             continue
 
         try:
-            # Normalize the original path first
-            normalized_original_path = original_path.replace("\\\\", "/")
+            normalized_original_path = original_path_str # Assumed already forward-slashed
             original_path_obj = Path(normalized_original_path)
+            filename = original_path_obj.name
 
-            # Find the relative path after the shot_code directory
+            dest_path_str: str
             path_parts = normalized_original_path.split('/')
-            relative_elements_path_str = None
 
-            try:
-                 # Find the index of the directory matching the constructed shot_code
-                 shot_code_index = -1
-                 for i, part in enumerate(path_parts):
-                     if part == shot_code:
-                          shot_code_index = i
-                          break
-                          
-                 if shot_code_index != -1 and shot_code_index < len(path_parts) - 1:
-                     # Join the parts *after* the shot_code directory
-                     relative_elements_path_str = "/".join(path_parts[shot_code_index + 1:])
-                 else:
-                      # Fallback: Use the full filename if shot_code not found or is the last element
-                      _log_print("warning", f"Shot code '{shot_code}' not found correctly in path '{normalized_original_path}'. Falling back to filename only.")
-                      relative_elements_path_str = original_path_obj.name
-                      
-            except ValueError:
-                 _log_print("warning", f"Could not split path based on shot code '{shot_code}' for: {normalized_original_path}. Falling back to filename.")
-                 relative_elements_path_str = original_path_obj.name
+            # First check if this is a Write/WriteFix output
+            is_write_output = False
+            node_name = node_knob.split('.')[0]  # Get node name from knob path
+            if nuke.exists(node_name):
+                node = nuke.toNode(node_name)
+                if node and (node.Class() in WRITE_NODE_CLASSES or _is_valid_writefix(node)):
+                    is_write_output = True
+                    _log_print("debug", f"Identified Write/WriteFix output: {node_name}")
 
+            if is_write_output:
+                # For Write/WriteFix outputs, use the images category and preserve version/resolution structure
+                try:
+                    # Get the version folder name (grandparent of the file)
+                    # Get the source path from the WriteFix node
+                    node = nuke.toNode(node_name)
+                    profile = node['profile'].value().lower()
+                    write_fix_path = node.knob(f'{profile}_location').value() + "/" + node.knob(f'{profile}_file').value()
+                    
+                    # Get the version folder path by going up two levels from the write_fix_path
+                    source_path = str(Path(write_fix_path).parent.parent)
+                    version_folder = Path(source_path).name
+                    
+                    # Construct destination path under images/version_folder
+                    final_dest_path_obj = base_spt_images_path / version_folder / filename
+                    dest_path_str = normalize_path(str(final_dest_path_obj))
+                    _log_print("debug", f"Write output rule: '{normalized_original_path}' -> '{dest_path_str}'")
+                except Exception as write_path_e:
+                    _log_print("error", f"Failed to construct Write output path for '{normalized_original_path}': {write_path_e}. Falling back to elements.")
+                    final_dest_path_obj = base_spt_elements_path / filename
+                    dest_path_str = normalize_path(str(final_dest_path_obj))
 
-            if not relative_elements_path_str:
-                 _log_print("warning", f"Could not determine relative element path for: {normalized_original_path}")
-                 continue
+            # Check for "assets" pattern
+            elif "assets" in path_parts:
+                try:
+                    assets_index = path_parts.index("assets")
 
-            # Apply the Comp/work/images rule
-            comp_match = comp_work_images_re.match(relative_elements_path_str)
-            if comp_match:
-                _log_print("debug", f"Applying Comp/work/images rule to: {relative_elements_path_str}")
-                relative_elements_path_str = comp_match.group(1) # Get the part after images/
-                _log_print("debug", f"Resulting relative path after rule: {relative_elements_path_str}")
+                    # New logic for assets:
+                    # Path: archive_root / {vendor} / "assets" / rest_of_asset_path
+                    vendor = str(temp_metadata['vendor'])
+                    vendor_fmt = VENDOR_DIR.format(vendor=vendor)
+                    
+                    asset_archive_base = Path(archive_root) / vendor_fmt / "assets"
+                    
+                    if assets_index + 1 < len(path_parts):
+                        asset_relative_structure = "/".join(path_parts[assets_index + 1:])
+                        final_dest_path_obj = asset_archive_base / asset_relative_structure
+                    else:
+                        _log_print("warning", f"Asset path '{normalized_original_path}' seems to end with 'assets'. Placing filename directly under asset_archive_base.")
+                        final_dest_path_obj = asset_archive_base / filename
 
+                    dest_path_str = normalize_path(str(final_dest_path_obj))
+                    _log_print("debug", f"Asset path rule (new vendor structure): '{normalized_original_path}' -> '{dest_path_str}'")
 
-            # Construct the final destination path
-            # Ensure the relative part doesn't start with / if base_archive_path handled it
-            final_relative_part = relative_elements_path_str.lstrip('/') 
-            # Prepend the consistent elements_category_archive_path
-            dest_path = elements_category_archive_path / final_relative_part
+                except (KeyError, ValueError) as asset_path_e:
+                    _log_print("error", f"Failed to apply new asset path rule for '{normalized_original_path}': {asset_path_e}. Falling back to 'elements' with filename.")
+                    final_dest_path_obj = base_spt_elements_path / filename 
+                    dest_path_str = normalize_path(str(final_dest_path_obj))
 
-            # Convert final path to string with forward slashes
-            dest_path_str = str(dest_path).replace("\\\\", "/")
+            else:
+                # Original logic for non-asset, non-write paths
+                relative_elements_path_str = None
+                is_shot_relative = False
+                try:
+                    shot_code_idx = -1
+                    for i, part in enumerate(path_parts):
+                        if part == shot_code:
+                            shot_code_idx = i
+                            break
+                    if shot_code_idx != -1 and shot_code_idx < len(path_parts) - 1:
+                        relative_elements_path_str = "/".join(path_parts[shot_code_idx + 1:])
+                        is_shot_relative = True
+                    else:
+                        relative_elements_path_str = filename
+                except ValueError:
+                    relative_elements_path_str = filename
+                
+                comp_match = comp_work_images_re.match(relative_elements_path_str)
+                if comp_match:
+                    relative_elements_path_str = comp_match.group(1)
+                    is_shot_relative = True
 
-            dependencies_to_copy[normalized_original_path] = dest_path_str
-            _log_print("debug", f"Mapped dependency: {normalized_original_path} -> {dest_path_str}")
+                if is_shot_relative:
+                    # Path is relative to shot_code or matched comp/work/images
+                    # Original line:
+                    # final_dest_path_obj = base_spt_elements_path / relative_elements_path_str.lstrip('/')
+                    
+                    # New logic: Include the source file's grandparent directory name directly
+                    # and then the filename.
+                    # Example: source_grandparent_name might be "BOB_110_005_010_CLN_v003"
+                    # filename would be "BOB_110_005_010_CLN_v003.1000.exr"
+                    source_grandparent_name = original_path_obj.parent.parent.name
+                    # filename is already defined a few lines above as original_path_obj.name
+                    
+                    final_dest_path_obj = base_spt_elements_path / source_grandparent_name / filename
+                    _log_print("debug", f"Default/shot-relative rule (custom structure): '{normalized_original_path}' -> '{normalize_path(str(final_dest_path_obj))}'")
+                else:
+                    # Not an asset, and not clearly shot-relative. Use "other" category.
+                    # Use the original file's parent directory name as a subfolder under "other".
+                    parent_dir_name = original_path_obj.parent.name if len(original_path_obj.parts) > 1 else "unknown_parent"
+                    other_subpath = Path(parent_dir_name) / filename
+                    final_dest_path_obj = base_spt_elements_path / "other" / other_subpath
+                    _log_print("debug", f"Other category rule: '{normalized_original_path}' -> '{normalize_path(str(final_dest_path_obj))}'")
+
+                dest_path_str = normalize_path(str(final_dest_path_obj))
+
+            dependencies_to_copy[original_path_str] = dest_path_str
 
         except Exception as map_e:
-            _log_print("error", f"Could not calculate destination for copying '{normalized_original_path}': {map_e}")
-            _log_print("debug", f"Exception details: {traceback.format_exc()}")
+            _log_print("error", f"Could not calculate destination for copying '{original_path_str}': {map_e}")
+            _log_print("debug", f"Exception details for {original_path_str}: {traceback.format_exc()}")
 
     return dependencies_to_copy
 
@@ -852,7 +911,6 @@ def _get_spt_path(
         vendor_fmt = VENDOR_DIR.format(vendor=vendor)
         show_fmt = SHOW_DIR.format(show=show)
         episode_fmt = EPISODE_DIR.format(episode=episode)
-        # Use the SHOT_DIR constant for the shot-level directory name
         shot_dir_fmt = SHOT_DIR.format(episode=episode, sequence=sequence, shot=shot_num, tag=tag)
 
         # --- Construct Path ---
@@ -862,7 +920,7 @@ def _get_spt_path(
         final_category_path = base_shot_path
         if relative_category_path_str:
             # Normalize slashes for the relative category path and remove leading/trailing
-            clean_relative_path = relative_category_path_str.replace("\\\\", "/").strip('/')
+            clean_relative_path = normalize_path(relative_category_path_str).strip('/')
             if '..' in clean_relative_path.split('/'):
                  _log_print("warning", f"Relative category path '{relative_category_path_str}' for SPT construction contains '..'. This might be unsafe.")
             final_category_path = base_shot_path / clean_relative_path
@@ -946,18 +1004,6 @@ def run_nuke_tasks(args: argparse.Namespace) -> Dict[str, Any]:
         results["gizmos_baked_count"] = baked_count
         _log_print("info", f"Step 7: Process Gizmo Baking COMPLETED. Baked {baked_count} gizmos. Node count now {len(required_nodes)}.")
         
-        # 8. Calculate Final Paths and Repath Knobs (Optional)
-        _log_print("info", "Step 8: Repathing Script Knobs (Optional)...")
-        dependency_map_for_repath, repath_count = repath_script_knobs(
-            required_nodes, 
-            dependency_info, 
-            args.repath_script,
-            args.archive_root, 
-            args.final_script_archive_path,
-            metadata_dict
-        )
-        results["repath_count"] = repath_count
-        _log_print("info", f"Step 8: Repath Script Knobs COMPLETED. Repathed {repath_count} knobs.")
         
         # 9. Select Required Nodes and Save Final Script
         _log_print("info", "Step 9: Saving Pruned Script...")
