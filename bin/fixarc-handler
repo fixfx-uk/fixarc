@@ -49,7 +49,7 @@ except ImportError:
     # Fallback to a basic logging configuration if 'fixfx.log' is not available.
     # This ensures that logging is still functional when run standalone.
     logging.basicConfig(
-        level=logging.DEBUG,  # Set root logger to allow DEBUG messages. Handler level is set in main().
+        level=logging.INFO,  # Changed from logging.DEBUG
         format='%(asctime)s [%(levelname)-7s] [%(name)s]: %(message)s'
     )
     log = logging.getLogger("fixarc.handler") # Create/get a logger specific to this script.
@@ -500,6 +500,7 @@ def main():
     # --- Process Found Scripts (Local Execution or Farm Submission) ---
     success_count = 0
     fail_count = 0
+    failed_script_details = [] # New list to store details of failed scripts
     try:
         current_user = os.getlogin()
     except OSError: # os.getlogin() can fail in some non-interactive/daemonized environments
@@ -555,22 +556,30 @@ def main():
             if not args.farm: # Local execution
                 log.info(f"Executing 'fixarc' locally for {script_basename}...") 
                 try:
-                    # Let the subprocess print directly to the console for live progress
-                    process = subprocess.run(base_cmd_args, check=True, text=True, encoding='utf-8')
+                    # Capture output to get stderr in case of failure
+                    process = subprocess.run(base_cmd_args, check=True, text=True, encoding='utf-8', capture_output=True)
                     log.info(f"Successfully archived: {script_basename}")
-                    # process.stdout and process.stderr will be None, as output goes to console
+                    if process.stdout.strip(): log.debug(f"  fixarc stdout:\n{process.stdout.strip()}") # Log stdout if any
                     success_count += 1
                 except subprocess.CalledProcessError as e:
-                    # If the subprocess fails, its output (if any) would have gone to console.
-                    # We can still log the return code.
                     log.error(f"'fixarc' command FAILED for: {script_basename} (Exit code: {e.returncode})")
-                    # e.stdout and e.stderr will be None if output wasn't captured.
+                    # Store failure details
+                    failed_script_details.append({
+                        "name": script_basename,
+                        "returncode": e.returncode,
+                        "stderr": e.stderr.strip() if e.stderr else "No stderr captured."
+                    })
+                    if e.stdout.strip(): log.warning(f"  fixarc stdout on error:\n{e.stdout.strip()}") # Log stdout on error if any
+                    if e.stderr.strip(): log.warning(f"  fixarc stderr on error:\n{e.stderr.strip()}") # Log full stderr at warning for detail
                     fail_count += 1
                 except FileNotFoundError: 
                     log.error(f"Critical error: 'fixarc' command not found at {fixarc_cmd_path} during execution attempt. Halting for {script_basename}.")
+                    failed_script_details.append({
+                        "name": script_basename,
+                        "returncode": -1, # Custom code for FileNotFoundError
+                        "stderr": f"'fixarc' command not found at {fixarc_cmd_path}."
+                    })
                     fail_count += 1 
-                    # Optionally, decide if this is fatal for all scripts or just this one
-                    # break 
             
             else: # Farm submission mode (Deadline)
                 log.info(f"Submitting 'fixarc' job to Deadline farm for: {script_basename}")
@@ -652,11 +661,33 @@ def main():
         log.info(f"Deadline job submission process complete.")
         log.info(f"Jobs successfully submitted to Deadline: {success_count}")
         log.info(f"Jobs failed to submit to Deadline: {fail_count}")
-        log.info("Note: Check Deadline Monitor for the actual completion status of submitted jobs.")
+        # Note: For farm jobs, detailed error reasons would be in Deadline Monitor logs
+        # We could list failed submission details if stored similarly to local failures.
+        # For now, this part focuses on local execution failures detailed reporting.
+        if failed_script_details: # If there were submission errors captured (though current logic doesn't populate this for farm)
+            log.error("Details of failed Deadline submissions:")
+            for failure in failed_script_details:
+                log.error(f"  - Script: {failure['name']}")
+                log.error(f"    Reason: {failure['stderr'][:500]}{'...' if len(failure['stderr']) > 500 else ''}")
+        log.info("Note: Check Deadline Monitor for the actual completion status and detailed logs of submitted jobs.")
     else:
         log.info(f"Local 'fixarc' execution complete.")
         log.info(f"Scripts successfully archived: {success_count}")
         log.info(f"Scripts failed to archive: {fail_count}")
+        if failed_script_details:
+            log.error("--- Details of Failed Scripts ---")
+            for failure in failed_script_details:
+                log.error(f"  Script: {failure['name']}")
+                # Attempt to get a concise error message, e.g., last few lines of stderr
+                error_lines = failure['stderr'].splitlines()
+                concise_error = "\n".join(error_lines[-5:]) # Last 5 lines, or fewer if less
+                if not concise_error and failure['stderr']: # if last 5 lines are empty but there is stderr
+                    concise_error = failure['stderr'][:300] + ('...' if len(failure['stderr']) > 300 else '')
+
+
+                log.error(f"    Exit Code: {failure['returncode']}")
+                log.error(f"    Error Snippet: {concise_error if concise_error else 'No specific error message captured in stderr.'}")
+                log.debug(f"    Full stderr for {failure['name']}:\n{failure['stderr']}") # Log full for debug
 
     if missing_search_roots: # Remind user at the end as well if some directories were not found
         log.warning("Reminder: Some expected source directories were missing during the search process:")
