@@ -24,7 +24,6 @@ import traceback
 import argparse
 from pathlib import Path # Use pathlib for path manipulation within Nuke
 from typing import Dict, List, Set, Optional, Tuple, Any # Use standard typing
-import tempfile
 import logging
 import re # Added for regex matching
 
@@ -33,6 +32,23 @@ logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s [%(levelname)s] %(message)s',
                     stream=sys.stderr)
 log = logging.getLogger(__name__)
+
+def _log_print(level: str, message: str) -> None:
+    """Simple print-based logging mimic for Nuke environment, now targets stderr."""
+    # Output format matches basic logger for parsing by main process if needed
+    # Using a direct print to sys.stderr for robustness in Nuke -t environment.
+    try:
+        # Basic sanitization for the message to avoid print errors with special chars.
+        safe_message = str(message).replace('\n', '\\n') # Escape newlines for single-line log output
+        print(f"[{level.upper():<7}] [NukeExecutor_LogPrintDirect] {safe_message}", file=sys.stderr)
+        sys.stderr.flush() # Ensure it gets written out immediately
+    except Exception as e:
+        # Fallback if printing the formatted message fails
+        try:
+            print(f"[ERROR] [NukeExecutor_LogPrintDirect] Error in _log_print itself: {e}", file=sys.stderr)
+            sys.stderr.flush()
+        except:
+            pass # If even this fails, suppress further errors
 
 def log_nuke_path_on_load():
     """Logs the NUKE_PATH environment variable as seen by Nuke."""
@@ -68,6 +84,7 @@ READ_NODE_CLASSES = frozenset([
     "GenerateLUT", "BlinkScript", "ParticleCache", "PointCloudGenerator", "STMap",
 ])
 ELEMENTS_REL = 'elements'
+PUBLISH_REL = 'publish'
 
 # Constants for relative paths
 PROJECT_REL = 'project'
@@ -82,12 +99,6 @@ SHOT_DIR = "{episode}_{sequence}_{shot}_{tag}" # Key constant for shot directory
 PROJECT_FILES_REL = "project/nuke" # For where .nk scripts are typically stored in archive
 
 # --- Helper Functions (Internal to this script) ---
-
-def _log_print(level: str, message: str) -> None:
-    """Simple print-based logging mimic for Nuke environment."""
-    # Output format matches basic logger for parsing by main process if needed
-    timestamp = traceback.extract_stack()[-2].name # Function name isn't useful here
-    print(f"[{level.upper():<7}] [NukeExecutor] {message}")
 
 def _is_valid_writefix(node: nuke.Node) -> bool:
     """Check if a Group node is a WriteFix gizmo excluding 'QuickReview'."""
@@ -211,7 +222,8 @@ def _find_associated_backdrops(nodes_to_check: Set[nuke.Node]) -> Set[nuke.Node]
 def _collect_dependency_paths(nodes: Set[nuke.Node]) -> Dict[str, Dict[str, Any]]:
     """
     Iterates through nodes and collects evaluated file paths from relevant knobs.
-    Returns: {'node_name.knob_name': {'evaluated_path': ..., 'original_path': ...}}
+    Also collects output paths from Write and WriteFix nodes.
+    Returns: {'node_name.knob_name': {'evaluated_path': ..., 'original_path': ..., 'dependency_category': 'elements'/'publish'}}
     """
     dependency_paths: Dict[str, Dict[str, Any]] = {}
     _log_print("info", f"Collecting dependency paths from {len(nodes)} nodes...")
@@ -232,56 +244,146 @@ def _collect_dependency_paths(nodes: Set[nuke.Node]) -> Dict[str, Dict[str, Any]
         node_name = node.fullName()
         node_class = node.Class()
         # _log_print("debug", f"Processing node {i+1}/{len(nodes)}: '{node_name}' (Class: {node_class})") # Log node being processed
-        # Define relevant knobs per class or check common ones
-        knobs_to_check: Dict[str, nuke.Knob] = {}
-        if node_class in READ_NODE_CLASSES | WRITE_NODE_CLASSES: # Check both for file knobs
-             knobs_to_check['file'] = node.knob('file')
-             knobs_to_check['proxy'] = node.knob('proxy')
-             # Add other known file knobs
-             if node_class == "OCIOFileTransform": knobs_to_check['cccid'] = node.knob('cccid')
-             if node_class == "Vectorfield": knobs_to_check['vfield_file'] = node.knob('vfield_file')
+        
+        knobs_to_collect: List[Tuple[str, nuke.Knob, str]] = [] # (knob_name, knob_obj, category)
+
+        # 1. Collect input-like dependencies (READ_NODE_CLASSES)
+        if node_class in READ_NODE_CLASSES:
+             # Define relevant knobs per class or check common ones
+             read_knobs_to_check: Dict[str, nuke.Knob] = {}
+             read_knobs_to_check['file'] = node.knob('file')
+             read_knobs_to_check['proxy'] = node.knob('proxy')
+             if node_class == "OCIOFileTransform": read_knobs_to_check['cccid'] = node.knob('cccid')
+             if node_class == "Vectorfield": read_knobs_to_check['vfield_file'] = node.knob('vfield_file')
              # ... add more specific knobs ...
+             for knob_name, knob_obj in read_knobs_to_check.items():
+                 if knob_obj:
+                     knobs_to_collect.append((knob_name, knob_obj, ELEMENTS_REL))
 
-        for knob_name, knob in knobs_to_check.items():
-            if not knob: continue
+        # 2. Collect output paths from Write nodes
+        elif node_class in WRITE_NODE_CLASSES: # This covers "Write", "WriteGeo", "DeepWrite"
+            file_knob = node.knob('file')
+            if file_knob:
+                _log_print("debug", f"Write node '{node_name}': Found 'file' knob. Original value: '{file_knob.value()}'")
+                knobs_to_collect.append(('file', file_knob, PUBLISH_REL))
+            # Potentially proxy knob as well if it can be an output
+            proxy_knob = node.knob('proxy')
+            if proxy_knob and proxy_knob.value(): # Check if proxy knob has a value
+                _log_print("debug", f"Write node '{node_name}': Found 'proxy' knob. Original value: '{proxy_knob.value()}'")
+                knobs_to_collect.append(('proxy', proxy_knob, PUBLISH_REL))
 
+
+        # 3. Collect output paths from WriteFix nodes
+        elif _is_valid_writefix(node): # It's a Group, and _is_valid_writefix passed
+            profile_knob = node.knob('profile')
+            if profile_knob:
+                profile_value = profile_knob.value()
+                if profile_value:
+                    location_knob_name = f"{profile_value.lower()}_location"
+                    location_knob = node.knob(location_knob_name)
+                    if location_knob:
+                        _log_print("debug", f"WriteFix '{node_name}': Profile '{profile_value}', found location knob '{location_knob_name}'. Original value: '{location_knob.value()}'")
+                        knobs_to_collect.append((location_knob_name, location_knob, PUBLISH_REL))
+                    else:
+                        _log_print("warning", f"WriteFix '{node_name}': Could not find location knob '{location_knob_name}' for profile '{profile_value}'.")
+                else:
+                    _log_print("warning", f"WriteFix '{node_name}': Profile knob has no value.")
+            else:
+                _log_print("warning", f"WriteFix '{node_name}': Missing 'profile' knob.")
+
+
+        for knob_name, knob, category in knobs_to_collect:
             original_path = None
-            evaluated_path = None
+            resolved_path = None # Changed from evaluated_path
+            is_directory = False # Initialize is_directory
+            exists_on_disk = False # Initialize exists_on_disk
             error_msg = None
-            _log_print("debug", f"  Checking knob: '{knob_name}' on node '{node_name}'") # Log knob being checked
+            _log_print("debug", f"  Checking knob: '{knob_name}' on node '{node_name}' (Category: {category}, KnobType: {type(knob).__name__})")
             try:
                 original_path = knob.value()
                 if not original_path: continue # Skip empty knobs
 
-                evaluated_path = knob.evaluate()
-                if not evaluated_path:
-                     _log_print("warning", f"Evaluated path for '{node_name}.{knob_name}' is empty. Original: '{original_path}'")
-                     continue # Skip empty evaluated paths
+                # Get resolved path: .value() for Text_Knob, .evaluate() for others if available
+                if isinstance(knob, nuke.Text_Knob): # Handles WriteFix location knobs
+                    resolved_path = original_path # For Text_Knob, value is the resolved path
+                    _log_print("debug", f"    Knob is Text_Knob. Using value() for resolved_path: '{resolved_path}'")
+                else:
+                    resolved_path = original_path # Fallback for knobs without evaluate
 
-                # Resolve relative paths against current script path
-                if script_dir and not os.path.isabs(evaluated_path): # Check if script_dir was obtained
-                     evaluated_path = os.path.abspath(os.path.join(script_dir, evaluated_path))
-                elif not os.path.isabs(evaluated_path):
-                    _log_print("warning", f"Cannot resolve relative path '{evaluated_path}' for '{node_name}.{knob_name}' as script directory is unavailable.")
 
-                # Normalize slashes
-                evaluated_path = evaluated_path.replace("\\", "/")
+                if not resolved_path: # Check after attempting to get it
+                     continue # Skip empty resolved paths
+                
+                # Normalize slashes early
+                resolved_path = str(resolved_path).replace("\\", "/") # Ensure string and normalize
+
+                # Resolve relative paths against current script path (applies to resolved_path)
+                if script_dir and not os.path.isabs(resolved_path):
+                     resolved_path_abs = os.path.abspath(os.path.join(script_dir, resolved_path))
+                     resolved_path = resolved_path_abs
+                elif not os.path.isabs(resolved_path):
+                    _log_print("warning", f"Cannot resolve relative path '{resolved_path}' for '{node_name}.{knob_name}' as script directory is unavailable. Path kept as is.")
+
+                # Final normalization (already done for resolved_path, do for original if needed for consistency)
+                if original_path: original_path = str(original_path).replace("\\", "/")
+
+                # Check existence and if it's a directory
+                try:
+                    exists_on_disk = os.path.exists(resolved_path)
+                    if exists_on_disk:
+                        is_directory = os.path.isdir(resolved_path)
+                        _log_print("debug", f"    Path '{resolved_path}' exists. Is directory: {is_directory}")
+                    else:
+                        # If it's a sequence pattern (e.g. %04d, ####, $F), its individual files might exist, 
+                        # but the pattern itself won't os.path.exists.
+                        is_potential_sequence = any(p in resolved_path for p in ["%0", "####", "$F"])
+                        if is_potential_sequence:
+                            if category == ELEMENTS_REL:
+                                parent_dir_of_sequence = os.path.dirname(resolved_path)
+                                if os.path.exists(parent_dir_of_sequence) and os.path.isdir(parent_dir_of_sequence):
+                                    _log_print("debug", f"    ELEMENTS sequence pattern '{resolved_path}'. Its parent dir '{parent_dir_of_sequence}' exists. Treating as directory dependency.")
+                                    resolved_path = parent_dir_of_sequence # Update resolved_path to be the directory
+                                    is_directory = True
+                                    exists_on_disk = True # The parent directory exists
+                                else:
+                                    _log_print("warning", f"    ELEMENTS sequence pattern '{resolved_path}'. Its parent dir '{parent_dir_of_sequence}' does NOT exist or is not a dir. Path collection might be problematic.")
+                                    # is_directory remains False, exists_on_disk is False for the pattern itself or its non-existent parent.
+                            else: # For PUBLISH_REL or other categories, keep current logic for sequences that don't directly exist
+                                _log_print("debug", f"    Path '{resolved_path}' (Category: {category}) looks like a sequence pattern and does not directly exist. is_directory check for pattern itself skipped.")
+                                # is_directory remains False, exists_on_disk is False for the pattern itself.
+                        else:
+                             _log_print("warning", f"    Path '{resolved_path}' for '{node_name}.{knob_name}' does not exist on disk. Will be treated as a file if archived (is_directory will be False).")
+                             # is_directory remains False, exists_on_disk is False
+                except Exception as path_check_e:
+                    _log_print("error", f"    Error checking path existence/type for '{resolved_path}': {path_check_e}")
 
             except Exception as e:
-                error_msg = f"Error evaluating '{knob_name}' for '{node_name}': {e}"
+                error_msg = f"Error processing knob '{knob_name}' for '{node_name}': {e}"
                 _log_print("error", error_msg)
+                _log_print("error", traceback.format_exc()) # Log full traceback for this error
 
             # Store result even if error occurred during evaluation
             manifest_key = f"{node_name}.{knob_name}"
             dependency_paths[manifest_key] = {
                 "original_path": original_path,
-                "evaluated_path": evaluated_path, # Store absolute, normalized path
-                "error": error_msg
+                "resolved_path": resolved_path, 
+                "error": error_msg,
+                "dependency_category": category, 
+                "is_directory": is_directory, # Store the flag
+                "exists_on_disk": exists_on_disk # Store existence status
             }
-            if error_msg: _log_print("debug", f"Stored entry for {manifest_key} with error.")
-            # else: _log_print("debug", f"Stored dependency: {manifest_key} -> {evaluated_path}") # Verbose
+            if error_msg: _log_print("debug", f"Stored entry for {manifest_key} with error and category '{category}'.")
+            # else: _log_print("debug", f"Stored dependency: {manifest_key} -> {resolved_path} (Category: {category}, Directory: {is_directory}, Exists: {exists_on_disk})")
 
-    _log_print("info", f"Collected {len(dependency_paths)} potential file dependency paths.")
+    # Enhanced log for the entire map
+    try:
+        _log_print("debug", f"Full dependency_paths collected: {json.dumps(dependency_paths, indent=2)}")
+    except TypeError: # Handle potential non-serializable data if any creeps in
+        _log_print("warning", "Could not serialize dependency_paths to JSON for full logging.")
+        _log_print("debug", f"Full dependency_paths (partial log due to serialization issue): {str(dependency_paths)[:1000]}...")
+
+
+    _log_print("info", f"Collected {len(dependency_paths)} potential file dependency paths with categories.")
     return dependency_paths
 
 
@@ -427,46 +529,64 @@ def _repath_nodes(
              knobs_to_check['proxy'] = node.knob('proxy')
              if node_class == "OCIOFileTransform": knobs_to_check['cccid'] = node.knob('cccid')
              if node_class == "Vectorfield": knobs_to_check['vfield_file'] = node.knob('vfield_file')
-             # Add more knobs as needed
+             # For WriteFix, the specific location knob (e.g. 'comp_location') would need to be identified here
+             # However, repathing WriteFix output paths is less common. Current collection gets them into dependency_info.
+             # If repathing them becomes a requirement, this section needs more specific logic for WriteFix.
 
         for knob_name, knob in knobs_to_check.items():
             if not knob: continue
 
-            current_eval_path = None
+            current_knob_value_path = None # Path from knob.value()
+            current_resolved_path_for_knob = None # Path after .evaluate() or special handling
+
             try:
-                current_eval_path_raw = knob.evaluate()
-                if not current_eval_path_raw: continue # Skip empty knobs
+                current_knob_value_path = knob.value() # This is the 'original_path'
+                if not current_knob_value_path: continue
 
-                # Resolve if relative and normalize
-                if script_dir and not os.path.isabs(current_eval_path_raw): # Check if script_dir was obtained
-                     current_eval_path = os.path.abspath(os.path.join(script_dir, current_eval_path_raw))
-                elif not os.path.isabs(current_eval_path_raw):
-                     current_eval_path = current_eval_path_raw # Keep as is, but log
-                     _log_print("warning", f"Cannot resolve relative path '{current_eval_path_raw}' for '{node_name}.{knob_name}' during repath as script directory is unavailable. Path kept as original.")
+                # Determine the resolved path for this specific knob, similar to collection logic
+                if isinstance(knob, nuke.Text_Knob):
+                    current_resolved_path_for_knob = current_knob_value_path
+                elif hasattr(knob, 'evaluate'):
+                    try:
+                        current_resolved_path_for_knob = knob.evaluate()
+                    except Exception:
+                        current_resolved_path_for_knob = current_knob_value_path # Fallback
                 else:
-                     current_eval_path = current_eval_path_raw
+                    current_resolved_path_for_knob = current_knob_value_path
 
-                current_eval_path = current_eval_path.replace("\\", "/")
 
-                # Check if this evaluated path is one we archived
-                if current_eval_path in dependency_map:
-                    final_archived_path = dependency_map[current_eval_path]
-                    if final_archived_path: # Ensure it was successfully mapped/archived
-                        # Calculate the new relative path
-                        relative_path = _calculate_relative_path_nuke(final_script_archive_path, final_archived_path)
-                        # Set the knob value *in memory*
-                        knob.setValue(relative_path)
-                        _log_print("debug", f"Repathed '{node_name}.{knob_name}': '{current_eval_path}' -> '{relative_path}'")
+                if not current_resolved_path_for_knob: continue # Skip if no resolved path
+
+                # Resolve if relative and normalize (using current_resolved_path_for_knob)
+                path_to_check_in_map = ""
+                if script_dir and not os.path.isabs(current_resolved_path_for_knob): 
+                     path_to_check_in_map = os.path.abspath(os.path.join(script_dir, current_resolved_path_for_knob))
+                elif not os.path.isabs(current_resolved_path_for_knob) and not script_dir:
+                     # Cannot resolve, but keep it to see if it's in the map as a relative key (unlikely for repath map)
+                     path_to_check_in_map = current_resolved_path_for_knob 
+                     _log_print("warning", f"Cannot resolve relative path '{current_resolved_path_for_knob}' for '{node_name}.{knob_name}' during repath as script directory is unavailable. Path kept as original for map lookup.")
+                else: # Is absolute or already resolved
+                     path_to_check_in_map = current_resolved_path_for_knob
+
+                path_to_check_in_map = str(path_to_check_in_map).replace("\\", "/")
+
+                # Check if this resolved path is one we archived and needs repathing
+                if path_to_check_in_map in dependency_map:
+                    final_archived_path = dependency_map[path_to_check_in_map]
+                    if final_archived_path: 
+                        relative_path_to_set = _calculate_relative_path_nuke(final_script_archive_path, final_archived_path)
+                        knob.setValue(relative_path_to_set)
+                        _log_print("debug", f"Repathed '{node_name}.{knob_name}': Original Script Value='{current_knob_value_path}', Resolved='{path_to_check_in_map}' -> New Script Value='{relative_path_to_set}'")
                         repath_count += 1
                     else:
-                        # Path was in manifest but failed archiving - don't repath
-                        _log_print("warning", f"Skipping repath for '{node_name}.{knob_name}': Original path '{current_eval_path}' failed archiving.")
-                        failed_repaths.append(f"{node_name}.{knob_name} (archive failed)")
-                # else: # Path not in our map, leave it alone
-                     # _log_print("debug", f"Path '{current_eval_path}' not in archive map for {node_name}.{knob_name}. Skipping repath.")
+                        _log_print("warning", f"Skipping repath for '{node_name}.{knob_name}': Resolved path '{path_to_check_in_map}' failed archiving (no final_archived_path).")
+                        failed_repaths.append(f"{node_name}.{knob_name} (archive failed for resolved path)")
+                # else:
+                     # _log_print("debug", f"Path '{path_to_check_in_map}' (from resolved '{current_resolved_path_for_knob}') not in archive map for {node_name}.{knob_name}. Skipping repath.")
 
             except Exception as e:
-                 _log_print("error", f"Error during repathing '{node_name}.{knob_name}' (Path: {current_eval_path}): {e}")
+                 _log_print("error", f"Error during repathing '{node_name}.{knob_name}' (Original Script Value: {current_knob_value_path}, Resolved Attempted: {current_resolved_path_for_knob}): {e}")
+                 _log_print("error", traceback.format_exc())
                  failed_repaths.append(f"{node_name}.{knob_name} (error: {e})")
 
     _log_print("info", f"Repathing finished. Set {repath_count} knob values.")
@@ -580,26 +700,25 @@ def repath_script_knobs(
     
     # First process each dependency to map to archive destination
     for node_knob, data in dependency_info.items():
-        orig_eval = data.get("evaluated_path")
-        if orig_eval and not data.get("error"):  # Only map valid, evaluated paths
+        # Use 'resolved_path' for repathing logic if available and no error
+        path_to_consider_for_repath = data.get("resolved_path")
+        dependency_category = data.get("dependency_category", ELEMENTS_REL) # Default to ELEMENTS_REL if not present
+        
+        if path_to_consider_for_repath and not data.get("error"):
             try:
-                filename = Path(orig_eval).name
-                # Use ELEMENTS_REL for the category for dependent files (non-script files)
-                # The final script itself is handled by final_script_archive_path which uses PROJECT_FILES_REL
-                category_for_dependency = ELEMENTS_REL 
-
-                # Use the new helper to construct the base directory for this category
+                filename = Path(path_to_consider_for_repath).name
+                
                 spt_category_dir = _get_spt_path(
-                    archive_root, # archive_root from main args
+                    archive_root, 
                     temp_metadata, 
-                    category_for_dependency
+                    dependency_category 
                 )
                 dest_path = spt_category_dir / filename
                 
-                dependency_map_for_repath[orig_eval] = str(dest_path).replace("\\\\", "/")
-                _log_print("debug", f"Mapped for repath: '{orig_eval}' → '{dependency_map_for_repath[orig_eval]}'")
+                dependency_map_for_repath[path_to_consider_for_repath] = str(dest_path).replace("\\", "/")
+                _log_print("debug", f"Mapped for repath: '{path_to_consider_for_repath}' \u2192 '{dependency_map_for_repath[path_to_consider_for_repath]}'")
             except Exception as map_e:
-                _log_print("error", f"Could not calculate destination for repathing '{orig_eval}': {map_e}")
+                _log_print("error", f"Could not calculate destination for repathing '{path_to_consider_for_repath}': {map_e}")
 
     # Now repath the knobs in memory using the calculated map
     repath_count = _repath_nodes(nodes, dependency_map_for_repath, final_script_path)
@@ -717,12 +836,14 @@ def save_pruned_script(nodes: Set[nuke.Node], final_script_path: str, archive_ro
             except Exception as e:
                 _log_print("warning", f"Failed to remove custom temp file {temp_nodes_file}: {e}")
 
-def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_root: str, metadata_dict: Dict[str, Any]) -> Dict[str, str]:
+def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_root: str, metadata_dict: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """
     Generates the final dependency map for copying files.
     Constructs archive paths preserving relative structure after the shot folder.
+    Uses 'dependency_category' from dependency_info to determine target SPT subfolder.
+    The output dictionary value will contain 'destination_path', 'is_directory', and 'exists_on_disk'.
     """
-    dependencies_to_copy = {}
+    dependencies_to_copy: Dict[str, Dict[str, Any]] = {} # Changed type hint and initialization
     _log_print("debug", "Generating final dependency map for copying...")
     temp_metadata = metadata_dict
     # Construct the expected shot code pattern (e.g., BOB_101_00X_010_WIG)
@@ -745,36 +866,59 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
     comp_work_images_re = re.compile(r"Comp/work/[^/]+/images/(.*)", re.IGNORECASE)
 
     # Base archive path construction for elements using the helper
-    try:
-        # Get the base directory for elements using the helper function
-        # This directory will be like: archive_root/vendor/show/episode/SHOT_DIR_formatted/elements
-        elements_category_archive_path = _get_spt_path(
-            str(archive_root), # Ensure it's a string
-            temp_metadata,
-            ELEMENTS_REL # Use the predefined constant for elements category
-        )
-    except (ConfigurationError, ArchiverError) as path_e:
-         _log_print("error", f"Cannot build base archive path for elements: {path_e}. Metadata: {temp_metadata}")
-         return {}
-    except Exception as base_path_e: # Catch any other unexpected error
-         _log_print("error", f"Unexpected error building base archive path for elements: {base_path_e}")
-         return {}
+    # This will be done per-dependency based on its category
+    # try:
+    #     # Get the base directory for elements using the helper function
+    #     # This directory will be like: archive_root/vendor/show/episode/SHOT_DIR_formatted/elements
+    #     elements_category_archive_path = _get_spt_path(
+    #         str(archive_root), # Ensure it's a string
+    #         temp_metadata,
+    #         ELEMENTS_REL # Use the predefined constant for elements category
+    #     )
+    # except (ConfigurationError, ArchiverError) as path_e:
+    #      _log_print("error", f"Cannot build base archive path for elements: {path_e}. Metadata: {temp_metadata}")
+    #      return {}
+    # except Exception as base_path_e: # Catch any other unexpected error
+    #      _log_print("error", f"Unexpected error building base archive path for elements: {base_path_e}")
+    #      return {}
          
-    _log_print("debug", f"Base archive path for elements (via helper): {elements_category_archive_path}")
+    # _log_print("debug", f"Base archive path for elements (via helper): {elements_category_archive_path}")
 
     for node_knob, data in dependency_info.items():
-        original_path = data.get("original_path")
-        if not original_path or data.get("error"):
-            _log_print("debug", f"Skipping mapping for {node_knob}: No original path or error encountered.")
+        original_path = data.get("original_path") 
+        resolved_path = data.get("resolved_path") # Use resolved_path for processing
+        dependency_category = data.get("dependency_category", ELEMENTS_REL) 
+        is_directory = data.get("is_directory", False) # Get directory flag
+        exists_on_disk = data.get("exists_on_disk", False)
+
+        _log_print("debug", f"generate_dependency_map: Processing Key='{node_knob}', OriginalPath='{original_path}', ResolvedPath='{resolved_path}', Category='{dependency_category}', IsDir='{is_directory}', Exists='{exists_on_disk}'")
+
+        if not resolved_path or data.get("error"):
+            _log_print("debug", f"Skipping mapping for {node_knob}: Missing resolved_path or error encountered. Data: {data}")
             continue
 
         try:
-            # Normalize the original path first
-            normalized_original_path = original_path.replace("\\\\", "/")
-            original_path_obj = Path(normalized_original_path)
+            # Get the base SPT directory for the specific category of this dependency
+            try:
+                category_spt_path = _get_spt_path(
+                    str(archive_root),
+                    temp_metadata,
+                    dependency_category 
+                )
+            except (ConfigurationError, ArchiverError) as path_e:
+                _log_print("error", f"Cannot build base archive path for category '{dependency_category}' for '{resolved_path}': {path_e}")
+                continue 
+            except Exception as base_path_e:
+                _log_print("error", f"Unexpected error building base archive path for category '{dependency_category}' for '{resolved_path}': {base_path_e}")
+                continue
 
-            # Find the relative path after the shot_code directory
-            path_parts = normalized_original_path.split('/')
+
+            # Normalize the resolved path (as this is what was on disk/resolved)
+            normalized_resolved_path = str(resolved_path).replace("\\", "/") # Already done, but ensure
+            resolved_path_obj = Path(normalized_resolved_path)
+
+            # Find the relative path after the shot_code directory (for structure preservation)
+            path_parts = normalized_resolved_path.split('/')
             relative_elements_path_str = None
 
             try:
@@ -789,43 +933,90 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
                      # Join the parts *after* the shot_code directory
                      relative_elements_path_str = "/".join(path_parts[shot_code_index + 1:])
                  else:
-                      # Fallback: Use the full filename if shot_code not found or is the last element
-                      _log_print("warning", f"Shot code '{shot_code}' not found correctly in path '{normalized_original_path}'. Falling back to filename only.")
-                      relative_elements_path_str = original_path_obj.name
+                      _log_print("warning", f"Shot code '{shot_code}' not found or is last part in path '{normalized_resolved_path}'. Using filename only for relative structure.")
+                      relative_elements_path_str = resolved_path_obj.name
                       
-            except ValueError:
-                 _log_print("warning", f"Could not split path based on shot code '{shot_code}' for: {normalized_original_path}. Falling back to filename.")
-                 relative_elements_path_str = original_path_obj.name
-
+            except ValueError: # Should not happen with split
+                 _log_print("warning", f"Could not split path based on shot code '{shot_code}' for: {normalized_resolved_path}. Falling back to filename.")
+                 relative_elements_path_str = resolved_path_obj.name
 
             if not relative_elements_path_str:
-                 _log_print("warning", f"Could not determine relative element path for: {normalized_original_path}")
-                 continue
+                 _log_print("warning", f"Could not determine relative element path for: {normalized_resolved_path}. Using filename only.")
+                 relative_elements_path_str = resolved_path_obj.name # Fallback
 
-            # Apply the Comp/work/images rule
-            comp_match = comp_work_images_re.match(relative_elements_path_str)
-            if comp_match:
-                _log_print("debug", f"Applying Comp/work/images rule to: {relative_elements_path_str}")
-                relative_elements_path_str = comp_match.group(1) # Get the part after images/
-                _log_print("debug", f"Resulting relative path after rule: {relative_elements_path_str}")
+            # Apply the Comp/work/images rule IF the category is ELEMENTS_REL
+            # Output paths (PUBLISH_REL) should typically maintain their structure from the 'publish' folder onwards
+            # or just be placed directly into the category_spt_path using their filename if they are not already in a complex structure.
+            
+            final_relative_part = relative_elements_path_str.lstrip('/')
+            
+            if dependency_category == ELEMENTS_REL:
+                comp_match = comp_work_images_re.match(relative_elements_path_str)
+                if comp_match:
+                    _log_print("debug", f"Applying Comp/work/images rule to (elements): {relative_elements_path_str}")
+                    final_relative_part = comp_match.group(1).lstrip('/')
+                    _log_print("debug", f"Resulting relative path after rule (elements): {final_relative_part}")
+            elif dependency_category == PUBLISH_REL:
+                # For publish paths, we usually want to place the file/folder directly into the
+                # 'publish' category directory, or maintain its existing sub-structure *if* it's simple (like version/resolution).
+                # The current logic using `relative_elements_path_str` (which is path after shot_code) might be too aggressive
+                # if the publish path is outside the shot_code structure or if we want to simplify it.
+                # For now, let's assume the `relative_elements_path_str` (if derived from inside shot_code)
+                # or just the filename (if derived from outside shot_code) is what we want under the category_spt_path.
+                # If the publish path was like /mnt/global_publish/show/shot/output.exr, then shot_code wouldn't match,
+                # and relative_elements_path_str would be 'output.exr'.
+                # If it was Z:/proj/bob01/shots/SHOT_CODE/publish/v001/img.exr, then relative_elements_path_str would be 'publish/v001/img.exr'.
+                # This needs adjustment if category is PUBLISH_REL to avoid double 'publish'.
+                
+                _log_print("debug", f"  Publish category. Original final_relative_part derived from source: '{final_relative_part}'")
+                # Check if final_relative_part starts with 'publish/' (case-insensitive for robustness if paths vary)
+                publish_prefix = "publish/"
+                if final_relative_part.lower().startswith(publish_prefix):
+                    final_relative_part = final_relative_part[len(publish_prefix):]
+                    _log_print("debug", f"  Stripped leading '{publish_prefix}'. New final_relative_part: '{final_relative_part}'")
+            
+            _log_print("debug", f"Using relative part for {dependency_category}: {final_relative_part} (derived from {relative_elements_path_str}, original resolved: {normalized_resolved_path})")
 
 
-            # Construct the final destination path
-            # Ensure the relative part doesn't start with / if base_archive_path handled it
-            final_relative_part = relative_elements_path_str.lstrip('/') 
-            # Prepend the consistent elements_category_archive_path
-            dest_path = elements_category_archive_path / final_relative_part
+            # Construct the final destination path using the category-specific SPT path
+            dest_path = category_spt_path / final_relative_part
 
             # Convert final path to string with forward slashes
-            dest_path_str = str(dest_path).replace("\\\\", "/")
+            dest_path_str = str(dest_path).replace("\\", "/")
 
-            dependencies_to_copy[normalized_original_path] = dest_path_str
-            _log_print("debug", f"Mapped dependency: {normalized_original_path} -> {dest_path_str}")
+            # The key for dependencies_to_copy should be the ORIGINAL path from the Nuke script knob,
+            # as this is what the main process will use to find the file on the source system.
+            # However, the resolved path is what we checked for existence and used for structure.
+            # The contract for dependencies_to_copy is {source_abs_on_disk_original_location : dest_abs_in_archive}
+            # So, original_path from the knob might be relative or contain unresolved tokens.
+            # resolved_path is the one that's resolved and absolute. This should be the key.
+            
+            # If original_path itself was a sequence string like `image.%04d.exr`
+            # and resolved_path was `/abs/path/to/image.%04d.exr`
+            # The copy mechanism needs the resolved, potentially sequence-expanded path.
+            # The existing `generate_dependency_map` seems to use `original_path` from `data.get("original_path")` as the key.
+            # Let's stick to `resolved_path` as the key because that's what's on disk.
+            # The main fixarc tool uses `dependency_info[key]['resolved_path']` as source for copy.
+
+            dependencies_to_copy[normalized_resolved_path] = { # Store as a dict
+                "destination_path": dest_path_str,
+                "is_directory": is_directory,
+                "exists_on_disk": exists_on_disk
+            }
+            _log_print("debug", f"Mapped dependency (Cat: {dependency_category}): '{normalized_resolved_path}' -> Dest: '{dest_path_str}', IsDir: {is_directory}, Exists: {exists_on_disk}")
+            _log_print("debug", f"generate_dependency_map: Added to dependencies_to_copy: Key='{normalized_resolved_path}', Data={{'destination_path': '{dest_path_str}', 'is_directory': {is_directory}, 'exists_on_disk': {exists_on_disk}}}")
 
         except Exception as map_e:
-            _log_print("error", f"Could not calculate destination for copying '{normalized_original_path}': {map_e}")
+            _log_print("error", f"Could not calculate destination for copying '{resolved_path}': {map_e}")
             _log_print("debug", f"Exception details: {traceback.format_exc()}")
 
+    # Enhanced log for the entire map
+    try:
+        _log_print("debug", f"Full dependencies_to_copy map: {json.dumps(dependencies_to_copy, indent=2)}")
+    except TypeError:
+        _log_print("warning", "Could not serialize dependencies_to_copy to JSON for full logging.")
+        _log_print("debug", f"Full dependencies_to_copy (partial log): {str(dependencies_to_copy)[:1000]}...")
+        
     return dependencies_to_copy
 
 def _get_spt_path(
@@ -935,12 +1126,36 @@ def run_nuke_tasks(args: argparse.Namespace) -> Dict[str, Any]:
         _log_print("info", f"Step 5: Collect Final Required Nodes COMPLETED. Total {len(required_nodes)} nodes.")
         
         # 6. Collect Dependency Paths
-        _log_print("info", "Step 6: Collecting Dependency Paths...")
-        dependency_info = collect_dependency_paths_from_nodes(required_nodes)
-        results["original_dependencies"] = dependency_info
-        _log_print("info", f"Step 6: Collect Dependency Paths COMPLETED. Found {len(dependency_info)} potential paths.")
+        _log_print("info", "Step 6: Collecting Dependency Paths (Inputs from required nodes + Outputs from all Write/WriteFix)...")
         
-        # 7. Bake Gizmos (Optional)
+        # Identify all relevant Write and WriteFix nodes for output path collection
+        all_target_output_nodes_set: Set[nuke.Node] = set()
+        root_nodes = nuke.allNodes(group=nuke.root()) # Get only nodes at the root level initially
+        _log_print("debug", f"Scanning {len(root_nodes)} root level nodes for explicit output path collection.")
+
+        for node in root_nodes: # Iterate over root nodes
+            # Check if it's a Write node type OR a valid WriteFix gizmo
+            if node.Class() in WRITE_NODE_CLASSES or _is_valid_writefix(node):
+                disable_knob = node.knob('disable')
+                if disable_knob and disable_knob.value():
+                    _log_print("debug", f"Skipping disabled output node for explicit path collection: {node.fullName()}")
+                    continue
+                all_target_output_nodes_set.add(node)
+                _log_print("debug", f"Added node '{node.fullName()}' (Class: {node.Class()}) to explicit output collection set.")
+        
+        _log_print("info", f"Found {len(all_target_output_nodes_set)} active root Write/WriteFix nodes for explicit output path collection.")
+
+        # Combine required_nodes (for script integrity and their inputs) 
+        # with all_target_output_nodes_set (for their outputs).
+        # The _collect_dependency_paths function will categorize paths correctly based on node type.
+        nodes_for_path_collection = required_nodes.union(all_target_output_nodes_set)
+        _log_print("info", f"Total unique nodes for path collection (required_nodes + explicit_outputs): {len(nodes_for_path_collection)}")
+        
+        dependency_info = _collect_dependency_paths(nodes_for_path_collection)
+        results["original_dependencies"] = dependency_info # This now contains inputs and outputs with categories
+        _log_print("info", f"Step 6: Collect Dependency Paths COMPLETED. Found {len(dependency_info)} potential paths from combined set.")
+        
+        # 7. Bake Gizmos (Optional) - Operates on required_nodes that are kept in the script
         _log_print("info", "Step 7: Processing Gizmo Baking (Optional)...")
         baked_count, required_nodes = process_gizmo_baking(required_nodes, args.bake_gizmos)
         results["gizmos_baked_count"] = baked_count
@@ -1030,7 +1245,20 @@ if __name__ == "__main__":
 
     finally:
         # --- Output final JSON results to stdout ---
-        _log_print("info", "--- NUKE EXECUTOR FINAL RESULTS ---")
+        # The json_start_tag MUST go to stdout for the calling process to parse it.
+        json_start_tag_message = "--- NUKE EXECUTOR FINAL RESULTS ---"
+        try:
+            print(json_start_tag_message, file=sys.stdout)
+            sys.stdout.flush()
+        except Exception as e_print_tag:
+            # If printing the tag itself fails, log to stderr and attempt to print basic failure JSON to stdout.
+            _log_print("error", f"CRITICAL: Failed to print json_start_tag to stdout: {e_print_tag}")
+            # Attempt to print a minimal error JSON directly to stdout if tag printing failed
+            try:
+                print(json.dumps({"status": "failure", "errors": ["Failed to print JSON start tag"]}, indent=4), file=sys.stdout)
+                sys.stdout.flush()
+            except:
+                pass # Final fallback, do nothing if even this fails
 
         # display nodes_kept count for brevity
         if "nodes_kept" in final_results:
@@ -1039,7 +1267,8 @@ if __name__ == "__main__":
         try:
             # Pretty print with indent
             json_output = json.dumps(final_results, indent=4)
-            print(json_output)
+            print(json_output, file=sys.stdout) # Explicitly print to stdout
+            sys.stdout.flush() # Ensure stdout is flushed
         except TypeError as json_e:
             # Fallback if results (already without nodes_kept) contain other non-serializable data
             _log_print("error", f"Error serializing final results: {json_e}")
@@ -1056,7 +1285,8 @@ if __name__ == "__main__":
                  "serialization_fallback": True
             }
             # Also pretty print fallback
-            print(json.dumps(fallback_results, indent=4))
+            print(json.dumps(fallback_results, indent=4), file=sys.stdout) # Explicitly print to stdout
+            sys.stdout.flush() # Ensure stdout is flushed
 
         _log_print("info", f"--- NUKE EXECUTOR SCRIPT END (Exit Code: {exit_code}) ---")
         # Nuke automatically exits after -t script finishes, but set code explicitly
