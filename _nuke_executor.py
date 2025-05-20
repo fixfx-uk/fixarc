@@ -249,7 +249,7 @@ def _collect_dependency_paths(nodes: Set[nuke.Node]) -> Dict[str, Dict[str, Any]
 
         # 1. Collect input-like dependencies (READ_NODE_CLASSES)
         if node_class in READ_NODE_CLASSES:
-             # Define relevant knobs per class or check common ones
+        # Define relevant knobs per class or check common ones
              read_knobs_to_check: Dict[str, nuke.Knob] = {}
              read_knobs_to_check['file'] = node.knob('file')
              read_knobs_to_check['proxy'] = node.knob('proxy')
@@ -307,6 +307,18 @@ def _collect_dependency_paths(nodes: Set[nuke.Node]) -> Dict[str, Dict[str, Any]
                 if isinstance(knob, nuke.Text_Knob): # Handles WriteFix location knobs
                     resolved_path = original_path # For Text_Knob, value is the resolved path
                     _log_print("debug", f"    Knob is Text_Knob. Using value() for resolved_path: '{resolved_path}'")
+                elif hasattr(knob, 'evaluate'):
+                    try:
+                        resolved_path = knob.evaluate()
+                        # Replace frame number with #### in resolved path
+                        if resolved_path:
+                            parts = resolved_path.split('.')
+                            if len(parts) >= 2 and parts[-2].isdigit():
+                                parts[-2] = '####'
+                                resolved_path = '.'.join(parts)
+                        _log_print("debug", f"    Knob has evaluate(). Evaluated path: '{resolved_path}'")
+                    except Exception as eval_e:
+                        resolved_path = original_path # Fallback to original value
                 else:
                     resolved_path = original_path # Fallback for knobs without evaluate
 
@@ -885,7 +897,7 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
     # _log_print("debug", f"Base archive path for elements (via helper): {elements_category_archive_path}")
 
     for node_knob, data in dependency_info.items():
-        original_path = data.get("original_path") 
+        original_path = data.get("original_path")
         resolved_path = data.get("resolved_path") # Use resolved_path for processing
         dependency_category = data.get("dependency_category", ELEMENTS_REL) 
         is_directory = data.get("is_directory", False) # Get directory flag
@@ -951,8 +963,8 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
             final_relative_part = relative_elements_path_str.lstrip('/')
             
             if dependency_category == ELEMENTS_REL:
-                comp_match = comp_work_images_re.match(relative_elements_path_str)
-                if comp_match:
+            comp_match = comp_work_images_re.match(relative_elements_path_str)
+            if comp_match:
                     _log_print("debug", f"Applying Comp/work/images rule to (elements): {relative_elements_path_str}")
                     final_relative_part = comp_match.group(1).lstrip('/')
                     _log_print("debug", f"Resulting relative path after rule (elements): {final_relative_part}")
@@ -1016,7 +1028,7 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
     except TypeError:
         _log_print("warning", "Could not serialize dependencies_to_copy to JSON for full logging.")
         _log_print("debug", f"Full dependencies_to_copy (partial log): {str(dependencies_to_copy)[:1000]}...")
-        
+
     return dependencies_to_copy
 
 def _get_spt_path(
