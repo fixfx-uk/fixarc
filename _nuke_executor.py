@@ -963,8 +963,8 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
             final_relative_part = relative_elements_path_str.lstrip('/')
             
             if dependency_category == ELEMENTS_REL:
-            comp_match = comp_work_images_re.match(relative_elements_path_str)
-            if comp_match:
+                comp_match = comp_work_images_re.match(relative_elements_path_str)
+                if comp_match:
                     _log_print("debug", f"Applying Comp/work/images rule to (elements): {relative_elements_path_str}")
                     final_relative_part = comp_match.group(1).lstrip('/')
                     _log_print("debug", f"Resulting relative path after rule (elements): {final_relative_part}")
