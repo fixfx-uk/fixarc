@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Union
 import sys
+import traceback
 
 # --- Fixenv Integration ---
 # fixenv is a hard dependency
@@ -72,7 +73,11 @@ def get_frame_padding_pattern(path: Union[str, Path]) -> Optional[str]:
     path_str = fixenv.normalize_path(path) # Use normalized
     percent_match = re.search(r"(%0*(\d*)d)", path_str)
     if percent_match: return percent_match.group(1)
-    if "####" in path_str: return "####"
+    
+    # Updated to detect one or more '#' characters
+    hash_match = re.search(r"(#+)", path_str)
+    if hash_match: return hash_match.group(1)
+    
     f_match = re.search(r"(\$F\d*)", path_str)
     if f_match: return f_match.group(1)
     return None
@@ -94,16 +99,38 @@ def expand_sequence_path(path_pattern: Union[str, Path], frame_range: Tuple[int,
     try:
         start, end = frame_range
         if end < start: end = start # Clamp range
-        # path_str = fixenv.normalize_path(path_pattern) # Remove this redundant normalization
         path_str = normalized_path_pattern # Use the already normalized path
-        padding = 4; num_format = "{frame:04d}" # Defaults
-        if pattern_token.startswith('%'):
-            match = re.match(r"%0*(\d*)d", pattern_token); padding = int(match.group(1)) if match and match.group(1) else 4; num_format = f"{{frame:0{padding}d}}"; base_path = path_str.replace(pattern_token, num_format, 1)
-        elif pattern_token == "####": padding = 4; num_format = "{frame:04d}"; base_path = path_str.replace("####", num_format, 1)
-        elif pattern_token.startswith('$F'): padding_str = pattern_token[2:]; padding = int(padding_str) if padding_str.isdigit() else 4; num_format = f"{{frame:0{padding}d}}"; base_path = path_str.replace(pattern_token, num_format, 1)
-        else: log.error(f"Unsupported pattern '{pattern_token}'"); return []
-        for i in range(start, end + 1): paths.append(base_path.format(frame=i))
-    except Exception as e: log.error(f"Error expanding sequence '{path_pattern}': {e}"); return []
+        
+        padding = 4 # Default padding
+        num_format_template = "{{frame:0{padding}d}}" # Default format string template
+
+        # Regex to match printf-style padding (e.g., %02d, %04d, %8d) or hash-based padding (e.g., #, ##, ####)
+        # It captures the padding number for %0Xd or the full sequence of hashes.
+        padding_match = re.match(r"(?:%0?(\d+)d|(#+))", pattern_token)
+
+        if padding_match:
+            if padding_match.group(1): # Matched %0Xd style
+                padding = int(padding_match.group(1))
+            elif padding_match.group(2): # Matched # style
+                padding = len(padding_match.group(2))
+            num_format_template = f"{{{{frame:0{padding}d}}}}" # Note: double braces for literal f-string brace
+            base_path = path_str.replace(pattern_token, num_format_template, 1)
+        elif pattern_token.startswith('$F'): # Handle $F style separately if needed, current logic seems okay
+            padding_str = pattern_token[2:]
+            padding = int(padding_str) if padding_str.isdigit() else 4
+            num_format_template = f"{{{{frame:0{padding}d}}}}"
+            base_path = path_str.replace(pattern_token, num_format_template, 1)
+        else:
+            log.error(f"Unsupported pattern token '{pattern_token}' in path '{path_str}'. Cannot determine padding.")
+            return [normalized_path_pattern] # Return original path if pattern is not understood
+        
+        for i in range(start, end + 1):
+            paths.append(base_path.format(frame=i))
+            
+    except Exception as e:
+        log.error(f"Error expanding sequence '{path_pattern}': {e}")
+        log.debug(traceback.format_exc()) # Add traceback for debugging
+        return [] # Return empty list on error
     return paths
 
 def find_sequence_range_on_disk(path_pattern: Union[str, Path]) -> Optional[Tuple[int, int]]:
@@ -123,7 +150,8 @@ def find_sequence_range_on_disk(path_pattern: Union[str, Path]) -> Optional[Tupl
         filename_pattern_part = Path(normalized_path_pattern).name; parts = filename_pattern_part.split(pattern_token, 1); file_prefix = parts[0]; file_suffix = parts[1] if len(parts) > 1 else ""
         padding = 4 # Default
         if pattern_token.startswith('%'): match = re.match(r"%0*(\d*)d", pattern_token); padding = int(match.group(1)) if match and match.group(1) else 4
-        elif pattern_token == "####": padding = 4
+        elif pattern_token.startswith('#'): # Updated to use length of '#' sequence
+            padding = len(pattern_token)
         elif pattern_token.startswith('$F'): padding_str = pattern_token[2:]; padding = int(padding_str) if padding_str.isdigit() else 4
         frame_regex_part = rf"(\d{{{padding}}})"
         escaped_prefix = re.escape(file_prefix); escaped_suffix = re.escape(file_suffix); frame_regex = re.compile(rf"^{escaped_prefix}{frame_regex_part}{escaped_suffix}$")
