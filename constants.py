@@ -41,6 +41,18 @@ LUT_REL: str = _rel_path(REFERENCE_REL, "lut")
 GEO_CACHE_REL: str = _rel_path(ELEMENTS_REL, "geo_cache") # Example for geo/alembic
 CAMERA_REL: str = _rel_path(TRACKS_REL, "camera")      # Example for cameras
 
+# --- Asset Handling ---
+ASSETS_REL: str = "assets" # Standard relative path for assets at vendor level
+# General library roots. Paths should be absolute and use forward slashes.
+# Trailing slash is recommended for robust prefix matching.
+LIBRARY_ROOTS: List[str] = [
+    "Z:/fxlb/",
+    "/mnt/fxlb/",
+    # Add other common, fixed library paths here
+]
+# Project-specific assets (e.g., Z:/proj/{project_name}/assets/) are handled dynamically
+# in the Nuke executor using metadata, but these general ones can be defined here.
+
 # --- Nuke Node Classes ---
 # Classes typically containing file paths for *reading* dependencies
 READ_NODE_CLASSES: FrozenSet[str] = frozenset([
@@ -91,6 +103,9 @@ __all__ = [
     'PROJECT_FILES_REL', 'ELEMENTS_REL', 'PRERENDERS_REL', 'ROTO_REL',
     'TRACKS_REL', 'CLEANPLATES_REL', 'MATTES_REL', 'REFERENCE_REL', 'LUT_REL',
     'GEO_CACHE_REL', 'CAMERA_REL',
+
+    # Asset Handling
+    'ASSETS_REL', 'LIBRARY_ROOTS',
 
     # Node Classes
     'READ_NODE_CLASSES', 'WRITE_NODE_CLASSES',

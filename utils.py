@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Union
 import sys
+import traceback
 
 # --- Fixenv Integration ---
 # fixenv is a hard dependency
@@ -72,7 +73,11 @@ def get_frame_padding_pattern(path: Union[str, Path]) -> Optional[str]:
     path_str = fixenv.normalize_path(path) # Use normalized
     percent_match = re.search(r"(%0*(\d*)d)", path_str)
     if percent_match: return percent_match.group(1)
-    if "####" in path_str: return "####"
+    
+    # Updated to detect one or more '#' characters
+    hash_match = re.search(r"(#+)", path_str)
+    if hash_match: return hash_match.group(1)
+    
     f_match = re.search(r"(\$F\d*)", path_str)
     if f_match: return f_match.group(1)
     return None
@@ -94,16 +99,38 @@ def expand_sequence_path(path_pattern: Union[str, Path], frame_range: Tuple[int,
     try:
         start, end = frame_range
         if end < start: end = start # Clamp range
-        # path_str = fixenv.normalize_path(path_pattern) # Remove this redundant normalization
         path_str = normalized_path_pattern # Use the already normalized path
-        padding = 4; num_format = "{frame:04d}" # Defaults
-        if pattern_token.startswith('%'):
-            match = re.match(r"%0*(\d*)d", pattern_token); padding = int(match.group(1)) if match and match.group(1) else 4; num_format = f"{{frame:0{padding}d}}"; base_path = path_str.replace(pattern_token, num_format, 1)
-        elif pattern_token == "####": padding = 4; num_format = "{frame:04d}"; base_path = path_str.replace("####", num_format, 1)
-        elif pattern_token.startswith('$F'): padding_str = pattern_token[2:]; padding = int(padding_str) if padding_str.isdigit() else 4; num_format = f"{{frame:0{padding}d}}"; base_path = path_str.replace(pattern_token, num_format, 1)
-        else: log.error(f"Unsupported pattern '{pattern_token}'"); return []
-        for i in range(start, end + 1): paths.append(base_path.format(frame=i))
-    except Exception as e: log.error(f"Error expanding sequence '{path_pattern}': {e}"); return []
+        
+        padding = 4 # Default padding
+        num_format_template = "{{frame:0{padding}d}}" # Default format string template
+
+        # Regex to match printf-style padding (e.g., %02d, %04d, %8d) or hash-based padding (e.g., #, ##, ####)
+        # It captures the padding number for %0Xd or the full sequence of hashes.
+        padding_match = re.match(r"(?:%0?(\d+)d|(#+))", pattern_token)
+
+        if padding_match:
+            if padding_match.group(1): # Matched %0Xd style
+                padding = int(padding_match.group(1))
+            elif padding_match.group(2): # Matched # style
+                padding = len(padding_match.group(2))
+            num_format_template = f"{{{{frame:0{padding}d}}}}" # Note: double braces for literal f-string brace
+            base_path = path_str.replace(pattern_token, num_format_template, 1)
+        elif pattern_token.startswith('$F'): # Handle $F style separately if needed, current logic seems okay
+            padding_str = pattern_token[2:]
+            padding = int(padding_str) if padding_str.isdigit() else 4
+            num_format_template = f"{{{{frame:0{padding}d}}}}"
+            base_path = path_str.replace(pattern_token, num_format_template, 1)
+        else:
+            log.error(f"Unsupported pattern token '{pattern_token}' in path '{path_str}'. Cannot determine padding.")
+            return [normalized_path_pattern] # Return original path if pattern is not understood
+        
+        for i in range(start, end + 1):
+            paths.append(base_path.format(frame=i))
+            
+    except Exception as e:
+        log.error(f"Error expanding sequence '{path_pattern}': {e}")
+        log.debug(traceback.format_exc()) # Add traceback for debugging
+        return [] # Return empty list on error
     return paths
 
 def find_sequence_range_on_disk(path_pattern: Union[str, Path]) -> Optional[Tuple[int, int]]:
@@ -123,7 +150,8 @@ def find_sequence_range_on_disk(path_pattern: Union[str, Path]) -> Optional[Tupl
         filename_pattern_part = Path(normalized_path_pattern).name; parts = filename_pattern_part.split(pattern_token, 1); file_prefix = parts[0]; file_suffix = parts[1] if len(parts) > 1 else ""
         padding = 4 # Default
         if pattern_token.startswith('%'): match = re.match(r"%0*(\d*)d", pattern_token); padding = int(match.group(1)) if match and match.group(1) else 4
-        elif pattern_token == "####": padding = 4
+        elif pattern_token.startswith('#'): # Updated to use length of '#' sequence
+            padding = len(pattern_token)
         elif pattern_token.startswith('$F'): padding_str = pattern_token[2:]; padding = int(padding_str) if padding_str.isdigit() else 4
         frame_regex_part = rf"(\d{{{padding}}})"
         escaped_prefix = re.escape(file_prefix); escaped_suffix = re.escape(file_suffix); frame_regex = re.compile(rf"^{escaped_prefix}{frame_regex_part}{escaped_suffix}$")
@@ -229,6 +257,7 @@ def execute_nuke_archive_process(
 
     # Use environment as is - NUKE_PATH is set up in the fixarc launcher script
     env = os.environ.copy()
+    env["NUKE_PATH"] = r"Z:\pipe\Nuke\main" # Add or override NUKE_PATH
     log.debug(f"Nuke Environment: {env}")
     
     log.info(f"Executing Nuke process with {timeout}s timeout... (Executor: {constants.NUKE_EXECUTOR_SCRIPT_PATH.name})")
@@ -445,16 +474,18 @@ def copy_file_or_sequence(source: str, dest: str, frame_range: Optional[Tuple[in
 
 # --- Robust File Copying ---
 def copy_files_robustly(
-    dependencies_to_copy: Dict[str, str], # {source_abs: dest_abs}
+    dependencies_to_copy: Dict[str, Dict[str, Any]], # MODIFIED type hint
     dry_run: bool = False
 ) -> Tuple[int, int]:
     """
-    Copies files listed in the dependency map using robocopy (Win) or rsync (Lin/Mac)
-    with shutil fallback. Handles sequences.
+    Copies files or directories listed in the dependency map using robocopy (Win) 
+    or rsync (Lin/Mac) with shutil fallback. Handles individual files, 
+    file sequences, and directories.
 
     Args:
-        dependencies_to_copy: Dictionary mapping absolute source paths to absolute
-                              destination paths.
+        dependencies_to_copy: Dictionary mapping absolute source paths to a dict
+                              containing 'destination_path', 'is_directory', 
+                              and 'exists_on_disk'.
         dry_run: If True, simulate copy operations.
 
     Returns:
@@ -462,192 +493,199 @@ def copy_files_robustly(
     """
     success_count = 0
     failure_count = 0
-    total_expected = len(dependencies_to_copy)
-    log.info(f"Starting robust file copy process for {total_expected} dependency item(s)...")
-    processed_sequences = set() # Track sequence patterns already handled
-    dots_printed = False # Flag to track if any dots were printed
+    
+    if not dependencies_to_copy:
+        log.info("No dependencies to copy.")
+        return 0, 0
+        
+    total_expected_entries = len(dependencies_to_copy)
+    log.info(f"Starting robust file copy process for {total_expected_entries} dependency item(s)...")
+    
+    processed_file_sequence_patterns = set() # Track sequence patterns already handled
+    dots_printed = False
 
-    items = list(dependencies_to_copy.items())
-    items.sort() # Process in a predictable order (helps with sequence handling)
+    # Sort items for somewhat predictable processing, helpful for logs
+    sorted_items = sorted(list(dependencies_to_copy.items()), key=lambda item: item[0])
 
-    for index, (source_path, dest_path) in enumerate(items):
+    for index, (source_path, dep_data) in enumerate(sorted_items):
+        destination_path = dep_data.get("destination_path")
+        is_directory = dep_data.get("is_directory", False)
+        # Default to True for exists_on_disk if key somehow missing, though it should always be provided by Nuke executor
+        exists_on_disk = dep_data.get("exists_on_disk", True) 
 
-        log.debug(f"Processing copy item {index+1}/{total_expected}: {source_path} -> {dest_path}")
+        log.debug(
+            f"Processing item {index+1}/{total_expected_entries}: "
+            f"Source='{source_path}', Dest='{destination_path}', "
+            f"IsDir={is_directory}, Exists={exists_on_disk}"
+        )
 
-        # Basic validation
-        if not source_path or not dest_path:
-            log.warning(f"Skipping invalid copy item: Source='{source_path}', Dest='{dest_path}'")
+        if not source_path or not destination_path:
+            log.warning(f"Skipping invalid copy item: Source='{source_path}', DestData='{dep_data}'")
+            failure_count += 1
+            continue
+
+        if not exists_on_disk:
+            log.warning(f"Skipping copy for non-existent source: {source_path} (Is Directory: {is_directory})")
             failure_count += 1
             continue
 
         norm_source = fixenv.normalize_path(source_path)
-        norm_dest = fixenv.normalize_path(dest_path)
+        norm_dest = fixenv.normalize_path(destination_path)
 
-        # Check for sequence pattern
-        is_seq = is_sequence(norm_source)
-        sequence_pattern = norm_source if is_seq else None
+        # Determine if it's a sequence of files (not a directory that might have sequence-like name)
+        is_file_sequence = is_sequence(norm_source) and not is_directory
 
-        # Skip sequences if the pattern was already processed by this loop
-        if is_seq and sequence_pattern in processed_sequences:
-             log.debug(f"Skipping already processed sequence pattern: {sequence_pattern}")
-             # Don't increment success/failure here, it was handled when first encountered
-             continue
+        if is_file_sequence and norm_source in processed_file_sequence_patterns:
+            log.debug(f"Skipping already processed file sequence pattern: {norm_source}")
+            continue
 
-        # Destination directory preparation is handled inside copy_file_or_sequence or external tools
-
-        # --- Perform Copy Operation ---
         copy_command = []
         use_shutil_fallback = False
         copy_success = False
-        num_files_in_op = 1 # Default for single files
+        items_in_current_operation = 0 
 
         try:
-            # --- Build Command (Robocopy/Rsync) ---
-            if is_seq:
-                source_sequence_dir = Path(norm_source).parent
-                dest_grandparent_dir = Path(norm_dest).parent.parent # Directory where the sequence folder will be placed
-                # The actual destination for the sequence dir will be dest_grandparent_dir / source_sequence_dir.name
-                final_dest_sequence_dir = dest_grandparent_dir / source_sequence_dir.name
+            if is_directory:
+                log.debug(f"Attempting to copy directory: {norm_source} -> {norm_dest}")
+                source_dir_path = Path(norm_source)
+                dest_dir_path = Path(norm_dest)
 
-                if not source_sequence_dir.is_dir():
-                    log.error(f"Source sequence directory not found: {source_sequence_dir}")
-                    use_shutil_fallback = True # Or mark as copy_success = False directly
-                    copy_success = False # Ensure this path leads to failure count
+                if not source_dir_path.is_dir(): 
+                    log.error(f"Source '{norm_source}' is marked as directory but not found on disk.")
+                    # copy_success remains False, will increment failure_count
                 else:
                     if fixenv.OS == fixenv.OS_WIN:
-                        command = [
-                            'robocopy', 
-                            str(source_sequence_dir), 
-                            str(final_dest_sequence_dir), 
+                        copy_command = [
+                            'robocopy', str(source_dir_path), str(dest_dir_path),
                             '/E', '/COPY:DAT', '/R:1', '/W:1', '/NJH', '/NJS', '/NP', '/NDL'
                         ]
-                        # Add /CREATE if dest exists to ensure it overlays correctly? Or /MIR for sync?
-                        # /E is usually sufficient for a one-way copy into a new/empty target.
-                        copy_command = command
-                    elif fixenv.OS == fixenv.OS_LIN or fixenv.OS == fixenv.OS_MAC:
-                        # rsync -rtq source_dir/ dest_dir/ (copies contents)
-                        # rsync -rtq source_dir dest_parent_dir/ (copies source_dir into dest_parent_dir)
-                        command = [
-                            'rsync', '-rtq', 
-                            str(source_sequence_dir), 
-                            str(dest_grandparent_dir) + '/' # Ensure trailing slash for parent dir
+                    elif fixenv.OS in [fixenv.OS_LIN, fixenv.OS_MAC]:
+                        rsync_src = str(source_dir_path)
+                        if not rsync_src.endswith('/'): rsync_src += '/'
+                        copy_command = [
+                            'rsync', '-rtq', '--inplace', rsync_src, str(dest_dir_path) + '/'
                         ]
-                        copy_command = command
                     else:
-                        log.debug(f"Using shutil fallback for sequence on unsupported OS: {norm_source}")
+                        log.debug(f"Directory copy: Using shutil fallback for {norm_source} on unsupported OS.")
                         use_shutil_fallback = True
             
-            # Original logic for single files
-            elif fixenv.OS == fixenv.OS_WIN and not is_seq: # Explicitly not is_seq
-                 src_dir = str(Path(norm_source).parent)
-                 src_file = Path(norm_source).name
-                 dest_dir = str(Path(norm_dest).parent)
-                 command = ['robocopy', src_dir, dest_dir, src_file, '/COPY:DAT', '/R:2', '/W:3', '/NJH', '/NJS', '/NP', '/NDL']
-                 if not dry_run and Path(norm_dest).exists(): command.append('/IS')
-                 copy_command = command
-            elif (fixenv.OS == fixenv.OS_LIN or fixenv.OS == fixenv.OS_MAC) and not is_seq: # Explicitly not is_seq
-                 command = ['rsync', '-rtq', norm_source, norm_dest] 
-                 copy_command = command
-            else:
-                 # Use shutil fallback for sequences on unsupported OS (already handled), or single files on unsupported OS
-                 log.debug(f"Using shutil fallback for: {norm_source}")
-                 use_shutil_fallback = True
+            elif is_file_sequence: 
+                log.debug(f"Attempting to copy file sequence: {norm_source} -> {norm_dest}")
+                if fixenv.OS == fixenv.OS_WIN:
+                    source_parent_dir = str(Path(norm_source).parent)
+                    sequence_file_name_pattern = Path(norm_source).name
+                    dest_files_parent_dir = str(Path(norm_dest).parent)
 
-            # --- Execute Command or Fallback ---
+                    nuke_token = get_frame_padding_pattern(sequence_file_name_pattern)
+                    dos_wildcard = sequence_file_name_pattern.replace(nuke_token, "*") if nuke_token else sequence_file_name_pattern
+                    
+                    copy_command = [
+                        'robocopy', source_parent_dir, dest_files_parent_dir, dos_wildcard,
+                        '/COPY:DAT', '/R:1', '/W:1', '/NJH', '/NJS', '/NP', '/NDL'
+                    ]
+                else: 
+                    log.debug(f"File sequence: Using shutil fallback for {norm_source} on {fixenv.OS}.")
+                    use_shutil_fallback = True
+            
+            else: # Single file
+                log.debug(f"Attempting to copy single file: {norm_source} -> {norm_dest}")
+                if fixenv.OS == fixenv.OS_WIN:
+                    src_parent = str(Path(norm_source).parent)
+                    src_filename = Path(norm_source).name
+                    dest_parent = str(Path(norm_dest).parent)
+                    copy_command = [
+                        'robocopy', src_parent, dest_parent, src_filename,
+                        '/COPY:DAT', '/R:2', '/W:3', '/NJH', '/NJS', '/NP', '/NDL'
+                    ]
+                    if not dry_run and Path(norm_dest).exists(): copy_command.append('/IS') 
+                elif fixenv.OS in [fixenv.OS_LIN, fixenv.OS_MAC]:
+                    copy_command = ['rsync', '-rtq', '--inplace', norm_source, norm_dest]
+                else:
+                    log.debug(f"Single file: Using shutil fallback for {norm_source} on unsupported OS.")
+                    use_shutil_fallback = True
+
+            # --- Execute Command or Shutil Fallback ---
             if copy_command and not use_shutil_fallback:
-                 if dry_run:
-                      log.info(f"[DRY RUN] Would execute: {' '.join(copy_command)}")
-                      copy_success = True 
-                 else:
-                      log.info(f"Executing copy: {' '.join(copy_command)}")
-                      # For directory copies, ensure the grandparent_dest exists if rsync/robocopy don't create it deep.
-                      # Robocopy creates the final_dest_sequence_dir. Rsync creates its target if parent exists.
-                      if is_seq:
-                          dest_grandparent_dir.mkdir(parents=True, exist_ok=True)
-                      else:
-                          Path(norm_dest).parent.mkdir(parents=True, exist_ok=True)
+                if dry_run:
+                    log.info(f"[DRY RUN] Would execute: {' '.join(copy_command)}")
+                    copy_success = True
+                    items_in_current_operation = 1 
+                else:
+                    # Ensure destination parent directory exists
+                    Path(norm_dest).parent.mkdir(parents=True, exist_ok=True)
+                    # For directory copies with robocopy/rsync, the target dir (norm_dest) itself might need to be made by the tool or explicitly.
+                    # Robocopy's /CREATE or rsync creating dest_dir_path handles this.
+                    # If is_directory, norm_dest is the directory. Its parent is Path(norm_dest).parent.
 
-                      copy_process = subprocess.run(copy_command, capture_output=True, text=True, check=False, encoding='utf-8', errors='replace')
-                      success_codes = {0, 1, 2, 3} if fixenv.OS == fixenv.OS_WIN else {0} # Robocopy success codes can be > 1
-                      if copy_process.returncode not in success_codes:
-                           log.error(f"Copy command failed for '{norm_source}' (Code: {copy_process.returncode}):")
-                           stdout = copy_process.stdout.strip()
-                           stderr = copy_process.stderr.strip()
-                           if stdout: log.error(f"stdout: {stdout}")
-                           if stderr: log.error(f"stderr: {stderr}")
-                           copy_success = False
-                      else:
-                           log.info(f"Successfully copied '{norm_source}' using external tool.")
-                           if not is_seq: # Only print dot for single files here, sequence copy is one op
-                               print(".", end="", flush=True)
-                               dots_printed = True
-                           else: # For sequences, we indicate one major operation
-                               log.info(f"Sequence directory operation for {norm_source} completed.")
-                               # We might want to count actual files copied if robocopy/rsync gives us that.
-                               # For now, assume 1 op = success for the entry.
-                               # If is_seq, num_files_in_op will be set by counting later if needed, or assumed 1 for the entry.
-                               pass 
-                           copy_success = True
-            elif use_shutil_fallback: # Corrected indentation for this block
-                 log.debug(f"Proceeding with shutil fallback for: {norm_source}")
-                 copied_pairs = copy_file_or_sequence(norm_source, norm_dest, frame_range=None, dry_run=dry_run)
-                 if copied_pairs:
-                     copy_success = True
-                     num_files_in_op = len(copied_pairs)
-                     if num_files_in_op > 0: dots_printed = True
-                 else:
-                     log.error(f"Shutil copy failed or resulted in zero files for: {norm_source}")
-                     copy_success = False
-            # Add an else here to catch cases where no command was built and not using shutil (e.g. sequence src dir missing)
-            elif not copy_command and not use_shutil_fallback and is_seq and not copy_success:
-                log.error(f"Skipping copy for sequence {norm_source} due to earlier error (e.g. source dir missing).")
-                # copy_success is already False
+                    log.info(f"Executing: {' '.join(copy_command)}")
+                    copy_process = subprocess.run(copy_command, capture_output=True, text=True, check=False, encoding='utf-8', errors='replace')
+                    
+                    robocopy_ok_codes = {0, 1, 2, 3} 
+                    rsync_ok_codes = {0}
+                    current_os_ok_codes = robocopy_ok_codes if fixenv.OS == fixenv.OS_WIN else rsync_ok_codes
 
-            # --- Update Counts ---
+                    if copy_process.returncode not in current_os_ok_codes:
+                        log.error(f"External copy command failed for '{norm_source}' (Code: {copy_process.returncode}):")
+                        stdout = copy_process.stdout.strip(); stderr = copy_process.stderr.strip()
+                        if stdout: log.error(f"  stdout: {stdout}")
+                        if stderr: log.error(f"  stderr: {stderr}")
+                    else:
+                        log.info(f"Successfully processed '{norm_source}' with external tool.")
+                        copy_success = True
+                        items_in_current_operation = 1 # Default to 1 op; more accurate counting is complex
+                        if not is_directory and not is_file_sequence and not dry_run: 
+                            print(".", end="", flush=True); dots_printed = True
+            
+            elif use_shutil_fallback:
+                log.debug(f"Using shutil fallback for: {norm_source} (IsDir: {is_directory}, IsFileSeq: {is_file_sequence})")
+                if dry_run:
+                    log.info(f"[DRY RUN] Shutil: {norm_source} -> {norm_dest}")
+                    copy_success = True
+                    items_in_current_operation = 1
+                else:
+                    if is_directory:
+                        try:
+                            Path(norm_dest).parent.mkdir(parents=True, exist_ok=True)
+                            if Path(norm_dest).exists(): shutil.rmtree(norm_dest) 
+                            shutil.copytree(norm_source, norm_dest)
+                            log.info(f"Shutil successfully copied directory: {norm_source} -> {norm_dest}")
+                            copy_success = True
+                            try: # Attempt to count items
+                                items_in_current_operation = sum(len(files) for _, _, files in os.walk(norm_dest)) + sum(len(dirs) for _, dirs, _ in os.walk(norm_dest))
+                            except Exception: items_in_current_operation = 1 # Fallback
+                        except Exception as e:
+                            log.error(f"Shutil copytree failed for {norm_source} -> {norm_dest}: {e}")
+                    else: # File or File Sequence with shutil
+                        copied_pairs = copy_file_or_sequence(norm_source, norm_dest, frame_range=None, dry_run=dry_run)
+                        if copied_pairs:
+                            copy_success = True
+                            items_in_current_operation = len(copied_pairs)
+                            if items_in_current_operation > 0 and not dry_run: 
+                                print(".", end="", flush=True); dots_printed = True
+                        else:
+                            log.error(f"Shutil copy_file_or_sequence failed or zero items for: {norm_source}")
+            else: 
+                 # This case implies source was not a dir (checked earlier) OR no command was built for some reason
+                 log.error(f"No copy action determined for {norm_source}. Check logic if source was valid.")
+                 # copy_success remains False
+
+            # Update counts
             if copy_success:
-                # For sequences copied with robocopy/rsync, num_files_in_op is 1 (one operation)
-                # unless we parse output to get actual file count.
-                # Shutil fallback sets num_files_in_op based on actual files copied.
-                if not use_shutil_fallback and is_seq: 
-                    # Heuristic: if it's a sequence and copied by external tool, 
-                    # try to count files for a more accurate success_count.
-                    # This is a placeholder - proper counting requires parsing output or listing dest_dir.
-                    try:
-                        num_files_in_op = len(list(Path(final_dest_sequence_dir).rglob('*')))
-                        log.info(f"Counted {num_files_in_op} files in destination for sequence {source_sequence_dir.name}")
-                    except Exception as e:
-                        log.warning(f"Could not count files in destination for sequence {source_sequence_dir.name}, assuming 1 op success. Error: {e}")
-                        num_files_in_op = 1 # Fallback if counting fails
-                elif use_shutil_fallback: # num_files_in_op is already set by shutil block
-                    pass 
-                else: # Single file copy
-                    num_files_in_op = 1
-                success_count += num_files_in_op
+                success_count += items_in_current_operation if items_in_current_operation > 0 else 1
             else:
-                # Estimate failure count: assume 1 for single file or guess sequence length?
-                # Better to just count 1 failure per entry that failed.
                 failure_count += 1
+            
+            if is_file_sequence: # Mark pattern as processed regardless of success/failure to avoid re-attempts
+                processed_file_sequence_patterns.add(norm_source)
 
-            # Mark sequence pattern as processed after attempting copy
-            if is_seq and sequence_pattern:
-                 processed_sequences.add(sequence_pattern)
+        except Exception as e:
+            log.error(f"Unexpected error processing copy item '{norm_source}' -> '{norm_dest}': {e}", exc_info=True)
+            failure_count += 1
+            if is_file_sequence: processed_file_sequence_patterns.add(norm_source)
 
-        except (DependencyError, ArchiverError, OSError, Exception) as e:
-             log.error(f"Failed to process copy item '{norm_source}' -> '{norm_dest}': {e}")
-             failure_count += 1
-             if is_seq and sequence_pattern: processed_sequences.add(sequence_pattern) # Mark as failed
+    if dots_printed: print() 
 
-    # Adjust success count if dry run (we only counted entries, not potential files)
-    if dry_run:
-        # This is tricky without actually expanding sequences. Report based on entries processed.
-        success_count = total_expected - failure_count # Assume all non-failed entries would succeed
-        log.info(f"[DRY RUN] Simulated copy process finished. Potential Success: {success_count}, Failures: {failure_count}")
-    else:
-        log.info(f"Robust copy process finished. Files Copied: {success_count}, Failures: {failure_count}")
-
-    if dots_printed:
-        print() # Print a newline character if dots were printed
-
+    log.info(f"Robust copy process finished. Items/Files Processed Successfully: {success_count}, Failures: {failure_count}")
     return success_count, failure_count
 
 

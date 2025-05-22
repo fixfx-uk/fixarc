@@ -22,7 +22,7 @@ if not any(isinstance(h, logging.StreamHandler) for h in log.handlers):
     log.addHandler(console_handler)
     log.debug("Added console handler to fixarc logger during initialization")
 
-__version__ = "0.2.0"
+__version__ = "1.2.0"
 
 # --- Exports ---
 # Expose the root logger AND the get_logger function for submodules to use
