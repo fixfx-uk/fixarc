@@ -27,14 +27,30 @@ from typing import Dict, List, Set, Optional, Tuple, Any, Union # Use standard t
 import logging
 import re # Added for regex matching
 
-# Import constants that will be used
-# from fixarc import constants as fixarc_constants # Assuming fixarc is in NUKE_PATH or sys.path # REMOVED
+# Configure logging based on NUKE_VERBOSITY environment variable
+# This ensures the executor script respects the verbosity level set by the parent process
+verbosity_level = os.environ.get("NUKE_VERBOSITY", "1")  # Default to INFO level
+try:
+    verbosity_level = int(verbosity_level)
+except ValueError:
+    verbosity_level = 1  # Default to INFO if parsing fails
 
 # Set up logging to stderr for the wrapper to capture
-logging.basicConfig(level=logging.DEBUG,
-                    format='%(asctime)s [%(levelname)s] %(message)s',
+if verbosity_level >= 2:
+    log_level = logging.DEBUG
+    log_format = '%(asctime)s [%(levelname)s] %(message)s'
+elif verbosity_level == 1:
+    log_level = logging.INFO
+    log_format = '%(asctime)s [%(levelname)s] %(message)s'
+else:
+    log_level = logging.WARNING
+    log_format = '%(asctime)s [%(levelname)s] %(message)s'
+
+logging.basicConfig(level=log_level,
+                    format=log_format,
                     stream=sys.stderr)
 log = logging.getLogger(__name__)
+log.debug(f"Nuke executor logging initialized at level: {logging.getLevelName(log_level)} (NUKE_VERBOSITY={verbosity_level})")
 
 def _log_print(level: str, message: str) -> None:
     """Simple print-based logging mimic for Nuke environment, now targets stderr."""
@@ -91,10 +107,10 @@ def log_nuke_path_on_load():
     """Logs the NUKE_PATH environment variable as seen by Nuke."""
     nuke_path = os.environ.get('NUKE_PATH', 'Not Set')
     log.debug(f"NUKE_PATH inside Nuke (onScriptLoad): {nuke_path}")
-    
+
     # Also check for other plugins in the path
     log.debug(f"Nuke plugin path: {nuke.pluginPath()}")
-    
+
     # Check if OCIOColorSpace exists
     try:
         if 'OCIO' in os.environ:
@@ -272,8 +288,8 @@ def _find_associated_backdrops(nodes_to_check: Set[nuke.Node]) -> Set[nuke.Node]
 
 def _collect_dependency_paths(
     nodes: Set[nuke.Node],
-    metadata_dict: Optional[Dict[str, Any]], # Added metadata_dict
-    library_roots_config: List[str] # Added library_roots_config (from fixarc_constants.LIBRARY_ROOTS)
+    metadata_dict: Optional[Dict[str, Any]],
+    library_roots_config: List[str]
 ) -> Dict[str, Dict[str, Any]]:
     """
     Iterates through nodes and collects file paths from relevant knobs.
@@ -285,16 +301,17 @@ def _collect_dependency_paths(
             "resolved_path_in_nuke": str,
             "source_item_on_disk": str,
             "dependency_category": str,
+            "matched_library_root": Optional[str],
             "is_source_directory": bool,
             "exists_on_disk": bool,
             "error": Optional[str]
         }, ...
     }
     """
-    dependency_details: Dict[str, Dict[str, Any]] = {} # Changed name for clarity
+    dependency_details: Dict[str, Dict[str, Any]] = {}
     _log_print("info", f"Collecting dependency paths from {len(nodes)} nodes...")
     script_dir = None
-    current_script_name = "Root" # Default if not found
+    current_script_name = "Root"
 
     if nodes:
         try:
@@ -306,43 +323,37 @@ def _collect_dependency_paths(
         except RuntimeError as e:
             _log_print("warning", f"Could not get script name for resolving relative paths: {e}")
 
-    # Construct project-specific assets path if metadata is available
     project_specific_asset_roots: List[str] = []
-    if metadata_dict and metadata_dict.get('project_name') and metadata_dict.get('project_base_path'):
+    if metadata_dict and metadata_dict.get('show'):
+        project_name = str(metadata_dict['show'])
         try:
-            project_base = Path(str(metadata_dict['project_base_path']).replace("\\", "/"))
-            project_name = str(metadata_dict['project_name'])
-            # Common pattern: Z:/proj/{project_name}/assets/
-            # Using Path.joinpath for robustness
-            proj_assets_path = project_base / project_name / "assets"
-            project_specific_asset_roots.append(str(proj_assets_path) + "/") # Add trailing slash
-            _log_print("debug", f"Derived project-specific asset root: {proj_assets_path}/")
+            project_asset_base_prefixes = ["Z:/proj/", "/mnt/proj/"]
+            for prefix_str in project_asset_base_prefixes:
+                prefix_path = Path(prefix_str.replace("\\", "/")) # Corrected: single backslash
+                proj_assets_path = prefix_path / project_name / "assets"
+                project_specific_asset_roots.append(str(proj_assets_path).replace("\\", "/") + "/") # Corrected: single backslash
+                _log_print("debug", f"Derived project-specific asset root: {str(proj_assets_path)}/")
         except Exception as e:
-            _log_print("warning", f"Could not construct project-specific asset root path: {e}")
-    
+            _log_print("warning", f"Could not construct project-specific asset root paths for project '{project_name}': {e}")
+
     all_library_roots = [Path(p.replace("\\", "/")) for p in library_roots_config] + \
-                        [Path(p.replace("\\", "/")) for p in project_specific_asset_roots]
+                        [Path(p.replace("\\", "/")) for p in project_specific_asset_roots] # Corrected: single backslash for elements of project_specific_asset_roots
     _log_print("debug", f"Effective library/asset roots for categorization: {all_library_roots}")
 
     for i, node in enumerate(nodes):
         node_name = node.fullName()
         node_class = node.Class()
+        knobs_to_process: List[Tuple[str, nuke.Knob, str]] = []
 
-        knobs_to_process: List[Tuple[str, nuke.Knob, str]] = [] # (knob_name, knob_obj, initial_category_hint)
-
-        # 1. Collect input-like dependencies
         if node_class in READ_NODE_CLASSES:
             read_knobs_to_check_map: Dict[str, nuke.Knob] = {}
             read_knobs_to_check_map['file'] = node.knob('file')
             read_knobs_to_check_map['proxy'] = node.knob('proxy')
             if node_class == "OCIOFileTransform": read_knobs_to_check_map['cccid'] = node.knob('cccid')
             if node_class == "Vectorfield": read_knobs_to_check_map['vfield_file'] = node.knob('vfield_file')
-            # ... add more specific knobs ...
             for knob_name, knob_obj in read_knobs_to_check_map.items():
                 if knob_obj:
                     knobs_to_process.append((knob_name, knob_obj, ELEMENTS_REL))
-
-        # 2. Collect output paths from Write nodes
         elif node_class in WRITE_NODE_CLASSES:
             file_knob = node.knob('file')
             if file_knob:
@@ -350,8 +361,6 @@ def _collect_dependency_paths(
             proxy_knob = node.knob('proxy')
             if proxy_knob and proxy_knob.value():
                 knobs_to_process.append(('proxy', proxy_knob, PUBLISH_REL))
-
-        # 3. Collect output paths from WriteFix nodes
         elif _is_valid_writefix(node):
             profile_knob = node.knob('profile')
             if profile_knob:
@@ -370,133 +379,116 @@ def _collect_dependency_paths(
                 "original_script_value": None,
                 "resolved_path_in_nuke": None,
                 "source_item_on_disk": None,
-                "dependency_category": initial_category_hint, # Start with hint
+                "dependency_category": initial_category_hint,
                 "is_source_directory": False,
                 "exists_on_disk": False,
-                "error": None
+                "error": None,
+                "matched_library_root": None
             }
 
             try:
                 original_script_value = knob.value()
-                data_dict["original_script_value"] = str(original_script_value).replace("\\", "/") if original_script_value else None
+                data_dict["original_script_value"] = str(original_script_value).replace("\\", "/") if original_script_value else None # Corrected: single backslash
 
                 if not original_script_value:
-                    _log_print("debug", f"  Knob '{knob_name}' on '{node_name}' is empty. Skipping further processing for this knob.")
-                    dependency_details[entry_key] = data_dict # Store minimal entry
+                    _log_print("debug", f"  Knob '{knob_name}' on '{node_name}' is empty. Skipping.")
+                    dependency_details[entry_key] = data_dict
                     continue
 
-                # Get resolved_path_in_nuke
                 resolved_path_in_nuke_str = None
-                if isinstance(knob, nuke.Text_Knob): # Handles WriteFix location knobs
+                if isinstance(knob, nuke.Text_Knob):
                     resolved_path_in_nuke_str = original_script_value
                 elif hasattr(knob, 'evaluate'):
                     try:
-                        # First check if original value contains frame patterns
                         original_has_pattern = is_sequence_pattern(original_script_value)
-                        
-                        # Evaluate the knob to get its resolved path
                         resolved_path = knob.evaluate()
-                        
-                        # If the original had a pattern that was lost in evaluation,
-                        # preserve the original filename with pattern
-                        if original_has_pattern:
-                            resolved_path_in_nuke_str = str(Path(resolved_path).parent / Path(original_script_value).name)
+                        if original_has_pattern and resolved_path: # Ensure resolved_path is not None
+                            resolved_path_parent = Path(resolved_path).parent
+                            original_filename = Path(original_script_value).name
+                            resolved_path_in_nuke_str = str(resolved_path_parent / original_filename)
                             _log_print("debug", f"    Preserved original sequence pattern: '{original_script_value}' -> '{resolved_path_in_nuke_str}'")
                         else:
                             resolved_path_in_nuke_str = resolved_path
-                            
                     except Exception as eval_e:
-                        _log_print("warning", f"    Error evaluating knob '{knob_name}' on '{node_name}': {eval_e}. Falling back to original value.")
+                        _log_print("warning", f"    Error evaluating knob '{knob_name}' on '{node_name}': {eval_e}. Falling back.")
                         resolved_path_in_nuke_str = original_script_value
                 else:
                     resolved_path_in_nuke_str = original_script_value
 
                 if not resolved_path_in_nuke_str:
-                    _log_print("debug", f"  Knob '{knob_name}' on '{node_name}' produced no resolved path. Skipping further processing.")
+                    _log_print("debug", f"  Knob '{knob_name}' on '{node_name}' produced no resolved path. Skipping.")
                     dependency_details[entry_key] = data_dict
                     continue
                 
-                resolved_path_in_nuke_str = str(resolved_path_in_nuke_str).replace("\\", "/")
+                resolved_path_in_nuke_str = str(resolved_path_in_nuke_str).replace("\\", "/") # Corrected: single backslash
                 data_dict["resolved_path_in_nuke"] = resolved_path_in_nuke_str
                 
-                # Absolutize resolved_path_in_nuke if relative (for on-disk checks and categorization)
-                # This path_for_checks is what we'll use to interact with the filesystem and for category decisions.
                 path_for_checks_str = resolved_path_in_nuke_str
                 if script_dir and not os.path.isabs(path_for_checks_str):
                     path_for_checks_str = os.path.abspath(os.path.join(script_dir, path_for_checks_str))
-                    path_for_checks_str = str(path_for_checks_str).replace("\\", "/")
+                    path_for_checks_str = str(path_for_checks_str).replace("\\", "/") # Corrected: single backslash
                     _log_print("debug", f"    Absolutized '{resolved_path_in_nuke_str}' to '{path_for_checks_str}' for checks.")
                 elif not os.path.isabs(path_for_checks_str):
-                     _log_print("warning", f"    Path '{path_for_checks_str}' is relative but script_dir is unavailable. On-disk checks might be inaccurate.")
+                     _log_print("warning", f"    Path '{path_for_checks_str}' is relative but script_dir unavailable. Checks might be inaccurate.")
 
-
-                # Determine source_item_on_disk and is_source_directory
-                data_dict["source_item_on_disk"] = path_for_checks_str # Default to the (now absolute) resolved path
                 path_for_checks_obj = Path(path_for_checks_str)
-
-                # Check if this is a sequence pattern
-                original_is_sequence = is_sequence_pattern(original_script_value)
-                resolved_is_sequence = is_sequence_pattern(resolved_path_in_nuke_str)
-                is_potential_sequence = original_is_sequence or resolved_is_sequence
-                
+                is_potential_sequence = is_sequence_pattern(data_dict["original_script_value"]) or \
+                                        is_sequence_pattern(resolved_path_in_nuke_str)
                 if is_potential_sequence:
-                    _log_print("debug", f"    Detected sequence pattern in '{path_for_checks_str}'")
+                    _log_print("debug", f"    Detected sequence pattern in '{path_for_checks_str}' (Original: '{data_dict['original_script_value']}', ResolvedNuke: '{resolved_path_in_nuke_str}')")
 
-                if path_for_checks_obj.is_dir():
-                    data_dict["is_source_directory"] = True
-                    _log_print("debug", f"    '{path_for_checks_str}' is an existing directory.")
-                    # source_item_on_disk is already path_for_checks_str, which is correct
-                elif is_potential_sequence and initial_category_hint == ELEMENTS_REL:
-                    # For ELEMENT inputs that are sequences, ALWAYS target the parent directory for archiving.
-                    parent_dir = path_for_checks_obj.parent
-                    data_dict["source_item_on_disk"] = str(parent_dir).replace("\\", "/")
-                    data_dict["is_source_directory"] = True
-                    _log_print("info", f"    ELEMENTS sequence pattern '{path_for_checks_str}'. Targeting parent directory for archive: '{data_dict['source_item_on_disk']}'")
-                    # The exists_on_disk check below will verify the parent_dir's existence.
-                # else, it's treated as a file or a pattern string for output. 
-                # is_source_directory remains False. source_item_on_disk remains path_for_checks_str.
+                # Step 1: Determine final dependency_category and matched_library_root
+                data_dict["dependency_category"] = initial_category_hint
+                data_dict["matched_library_root"] = None
                 
-                # Determine exists_on_disk for the 'source_item_on_disk'
-                source_item_to_check_obj = Path(data_dict["source_item_on_disk"])
-                if data_dict["is_source_directory"]: # This is now true if we targeted a parent dir for a sequence
-                    data_dict["exists_on_disk"] = source_item_to_check_obj.is_dir()
-                    if not data_dict["exists_on_disk"] and is_potential_sequence and initial_category_hint == ELEMENTS_REL:
-                        _log_print("warning", f"    Targeted parent directory '{data_dict['source_item_on_disk']}' for ELEMENTS sequence '{path_for_checks_str}' does not exist or is not a directory.")
-                else: # File or pattern string (not a sequence's parent dir)
-                    data_dict["exists_on_disk"] = source_item_to_check_obj.exists() 
-                    if not data_dict["exists_on_disk"] and is_potential_sequence:
-                         _log_print("debug", f"    Pattern string '{data_dict['source_item_on_disk']}' does not exist as a single file (expected for patterns if not archiving parent).")
-
-
-                # Determine dependency_category
-                # path_for_checks_str is absolute here (or was warned about)
-                categorized = False
-                path_to_categorize_obj = Path(path_for_checks_str) # Use the resolved, absolute path for categorization
-                
+                path_to_categorize_obj = path_for_checks_obj
                 for lib_root in all_library_roots:
-                    # Path.is_relative_to() is Python 3.9+
-                    # Manual check:
                     try:
-                        if str(path_to_categorize_obj).lower().startswith(str(lib_root).lower()):
+                        normalized_lib_root_str = str(lib_root).replace("\\", "/").rstrip("/") # Corrected: single backslash
+                        normalized_path_to_categorize_str = str(path_to_categorize_obj).replace("\\", "/") # Corrected: single backslash
+                        if normalized_path_to_categorize_str.lower().startswith(normalized_lib_root_str.lower() + "/"):
                             data_dict["dependency_category"] = ASSETS_REL
+                            data_dict["matched_library_root"] = str(lib_root)
                             _log_print("debug", f"    Categorized '{path_for_checks_str}' as '{ASSETS_REL}' based on root '{lib_root}'")
-                            categorized = True
                             break
-                    except Exception as e_cat: # Should not happen with string ops
+                    except Exception as e_cat:
                         _log_print("warning", f"    Error during library root comparison for '{path_to_categorize_obj}' against '{lib_root}': {e_cat}")
+                
+                if data_dict["dependency_category"] == initial_category_hint:
+                     _log_print("debug", f"    Path '{path_for_checks_str}' not in library roots. Using initial hint: '{initial_category_hint}'")
 
+                # Step 2: Determine source_item_on_disk and is_source_directory
+                data_dict["source_item_on_disk"] = path_for_checks_str
+                data_dict["is_source_directory"] = path_for_checks_obj.is_dir()
 
-                if not categorized:
-                    # Fallback to initial hint (ELEMENTS_REL or PUBLISH_REL)
-                     _log_print("debug", f"    Path '{path_for_checks_str}' not in library roots. Using initial category hint: '{initial_category_hint}'")
-                     data_dict["dependency_category"] = initial_category_hint
+                # Rule: For input sequences (ASSETS_REL or ELEMENTS_REL), target their parent directory.
+                if is_potential_sequence and data_dict["dependency_category"] != PUBLISH_REL:
+                    if not path_for_checks_obj.is_dir(): # Only if the path itself isn't already a directory
+                        parent_dir = path_for_checks_obj.parent
+                        data_dict["source_item_on_disk"] = str(parent_dir).replace("\\", "/") # Corrected: single backslash
+                        data_dict["is_source_directory"] = True
+                        _log_print("info", f"    Input sequence '{path_for_checks_str}' (Cat: {data_dict['dependency_category']}). Targeting parent dir for archive: '{data_dict['source_item_on_disk']}'.")
 
-                # Log final decision for this item
+                # Step 3: Determine exists_on_disk for the (potentially updated) source_item_on_disk
+                source_item_to_check_obj = Path(data_dict["source_item_on_disk"])
+                if data_dict["is_source_directory"]:
+                    data_dict["exists_on_disk"] = source_item_to_check_obj.is_dir()
+                    if not data_dict["exists_on_disk"]:
+                        if is_potential_sequence and data_dict["dependency_category"] != PUBLISH_REL and data_dict["source_item_on_disk"] != path_for_checks_str: # i.e. we changed it to parent
+                             _log_print("warning", f"    Targeted parent directory '{data_dict['source_item_on_disk']}' for INPUT sequence '{path_for_checks_str}' does not exist or is not a directory.")
+                        else:
+                             _log_print("debug", f"    Targeted directory '{data_dict['source_item_on_disk']}' does not exist or is not a directory.")
+                else:
+                    data_dict["exists_on_disk"] = source_item_to_check_obj.exists()
+                    if not data_dict["exists_on_disk"]:
+                         _log_print("debug", f"    File/Pattern '{data_dict['source_item_on_disk']}' does not exist on disk.")
+                
                 _log_print("debug", f"  Collected for '{entry_key}': "
                                    f"Orig='{data_dict['original_script_value']}', "
                                    f"ResolvedNuke='{data_dict['resolved_path_in_nuke']}', "
                                    f"SourceDisk='{data_dict['source_item_on_disk']}', "
                                    f"Cat='{data_dict['dependency_category']}', "
+                                   f"MatchedRoot='{data_dict['matched_library_root']}', "
                                    f"IsDir='{data_dict['is_source_directory']}', "
                                    f"Exists='{data_dict['exists_on_disk']}'")
 
@@ -996,7 +988,7 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
             _log_print("debug", f"Skipping mapping for item key \'{node_knob_identifier}\' (\'{source_path_for_copy}\'): Error encountered during collection. Data: {data}")
             continue
 
-        normalized_source_path_for_copy = str(source_path_for_copy).replace("\\\\", "/")
+        normalized_source_path_for_copy = str(source_path_for_copy).replace("\\", "/")
 
         if normalized_source_path_for_copy in dependencies_to_copy:
             _log_print("debug", f"Skipping mapping for item key \'{node_knob_identifier}\': Source path \'{normalized_source_path_for_copy}\' already processed.")
@@ -1022,20 +1014,31 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
             shot_code_found_in_path = False
             try:
                 shot_code_idx = -1
-                for i, part in enumerate(path_parts):
-                    if part == shot_code:
-                        shot_code_idx = i
-                        break
-                
-                if shot_code_idx != -1:
-                    shot_code_found_in_path = True
-                    final_relative_part = "/".join(path_parts[shot_code_idx + 1:])
-                    _log_print("debug", f"  Derived relative part \'{final_relative_part}\' from source \'{normalized_source_path_for_copy}\' after shot code \'{shot_code}\'.")
-                else:
-                    final_relative_part = source_path_obj.name
-                    _log_print("debug", f"  Shot code \'{shot_code}\' not found in source path \'{normalized_source_path_for_copy}\'. Using item name \'{final_relative_part}\' as relative part under category \'{dependency_category}\'.")
+                # For ASSETS_REL, we need to use the matched library root to determine the relative part.
+                if dependency_category == ASSETS_REL and data.get("matched_library_root"):
+                    matched_root_str = str(data["matched_library_root"]).replace("\\", "/").rstrip("/")
+                    source_path_str = normalized_source_path_for_copy.replace("\\", "/")
+                    if source_path_str.lower().startswith(matched_root_str.lower() + "/"):
+                        final_relative_part = source_path_str[len(matched_root_str) + 1:] # Get the part after the root + '/'
+                        _log_print("debug", f"  Derived ASSET relative part '{final_relative_part}' from source '{normalized_source_path_for_copy}' relative to matched root '{matched_root_str}'.")
+                    else:
+                        _log_print("warning", f"  ASSET '{normalized_source_path_for_copy}' did not start with its matched_library_root '{matched_root_str}' as expected. Falling back to item name.")
+                        final_relative_part = source_path_obj.name # Fallback
+                else: # Original logic for non-ASSETS_REL or if matched_library_root is missing
+                    for i, part in enumerate(path_parts):
+                        if part == shot_code:
+                            shot_code_idx = i
+                            break
+                    
+                    if shot_code_idx != -1:
+                        shot_code_found_in_path = True
+                        final_relative_part = "/".join(path_parts[shot_code_idx + 1:])
+                        _log_print("debug", f"  Derived relative part '{final_relative_part}' from source '{normalized_source_path_for_copy}' after shot code '{shot_code}'.")
+                    else:
+                        final_relative_part = source_path_obj.name
+                        _log_print("debug", f"  Shot code '{shot_code}' not found in source path '{normalized_source_path_for_copy}'. Using item name '{final_relative_part}' as relative part under category '{dependency_category}'.")
 
-            except ValueError:
+            except ValueError: # This was for the shot_code splitting, might be less relevant if ASSETS_REL uses direct relative pathing.
                  _log_print("warning", f"  Could not split path based on shot code for: {normalized_source_path_for_copy}. Falling back to item name.")
                  final_relative_part = source_path_obj.name
             
@@ -1063,7 +1066,7 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
             final_relative_part = final_relative_part.lstrip('/')
 
             dest_path = category_spt_path / final_relative_part
-            dest_path_str = str(dest_path).replace("\\\\", "/")
+            dest_path_str = str(dest_path).replace("\\", "/")
 
             dependencies_to_copy[normalized_source_path_for_copy] = {
                 "destination_path": dest_path_str,
@@ -1132,7 +1135,7 @@ def _get_spt_path(
         final_category_path = base_shot_path
         if relative_category_path_str:
             # Normalize slashes for the relative category path and remove leading/trailing
-            clean_relative_path = relative_category_path_str.replace("\\\\", "/").strip('/')
+            clean_relative_path = relative_category_path_str.replace("\\", "/").strip('/')
             if '..' in clean_relative_path.split('/'):
                  _log_print("warning", f"Relative category path '{relative_category_path_str}' for SPT construction contains '..'. This might be unsafe.")
             final_category_path = base_shot_path / clean_relative_path

@@ -539,6 +539,16 @@ def main():
             # Construct the base command for 'fixarc'
             base_cmd_args = [fixarc_cmd_path, script_norm, "--archive-root", args.archive_root]
             
+            # Add verbosity flags based on the current verbosity level
+            # This ensures the verbosity is propagated to the fixarc subprocess
+            # and subsequently to the nuke -t executor subprocess
+            if args.verbose >= 2:
+                base_cmd_args.append("-vv")  # DEBUG level
+                log.debug("Adding -vv flag to fixarc command for DEBUG verbosity")
+            elif args.verbose == 1:
+                base_cmd_args.append("-v")   # INFO level
+                log.debug("Adding -v flag to fixarc command for INFO verbosity")
+            
             # Add client config if specified
             if args.client_config:
                 if not os.path.isfile(args.client_config):

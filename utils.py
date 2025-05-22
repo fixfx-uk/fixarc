@@ -258,6 +258,18 @@ def execute_nuke_archive_process(
     # Use environment as is - NUKE_PATH is set up in the fixarc launcher script
     env = os.environ.copy()
     env["NUKE_PATH"] = r"Z:\pipe\Nuke\main" # Add or override NUKE_PATH
+    
+    # Set NUKE_VERBOSITY environment variable based on current log level to propagate verbosity
+    current_log_level = log.getEffectiveLevel()
+    if current_log_level <= logging.DEBUG:
+        env["NUKE_VERBOSITY"] = "2"  # DEBUG
+        log.debug("Setting NUKE_VERBOSITY=2 (DEBUG) for Nuke subprocess")
+    elif current_log_level <= logging.INFO:
+        env["NUKE_VERBOSITY"] = "1"  # INFO
+        log.debug("Setting NUKE_VERBOSITY=1 (INFO) for Nuke subprocess")
+    else:
+        env["NUKE_VERBOSITY"] = "0"  # WARNING or higher
+    
     log.debug(f"Nuke Environment: {env}")
     
     log.info(f"Executing Nuke process with {timeout}s timeout... (Executor: {constants.NUKE_EXECUTOR_SCRIPT_PATH.name})")
