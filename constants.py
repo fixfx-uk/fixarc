@@ -4,11 +4,11 @@ import os
 from typing import Dict, List, FrozenSet, Callable, Any
 from pathlib import Path
 
-# Import fixenv directly
-import fixenv
+# Import fixenv constants submodule
+from fixenv import constants as fixenv_constants
 
 # Use studio short name from fixenv
-DEFAULT_VENDOR_NAME = getattr(fixenv.constants, 'STUDIO_SHORT_NAME', 'FixFX')
+DEFAULT_VENDOR_NAME = getattr(fixenv_constants, 'STUDIO_SHORT_NAME', 'FixFX')
 
 # --- SPT v3.2.0 Folder Names (Placeholders for format()) ---
 # These should match the spec exactly. Use braces {} for placeholders.
@@ -89,10 +89,14 @@ NUKE_EXECUTOR_SCRIPT_NAME: str = "_nuke_executor.py"
 # Path to the internal Nuke script (derived from this file's location)
 NUKE_EXECUTOR_SCRIPT_PATH: Path = Path(__file__).parent / NUKE_EXECUTOR_SCRIPT_NAME
 
+# --- Deadline Configuration ---
+# These are sensitive and might be better managed via environment variables or a config file in a real setup.
+DEADLINE_SERVER_ADDRESS: str = "192.168.14.230"
+DEADLINE_SERVER_PORT: int = 8081
+DEADLINE_USER: str = "fixrs-001"
+DEADLINE_PASSWORD: str = "" # Assuming no password as per example
+
 __all__ = [
-    # OS Detection (via fixenv)
-    'fixenv',
-    
     # Default Vendor Name
     'DEFAULT_VENDOR_NAME',
 
@@ -116,4 +120,10 @@ __all__ = [
     # Internal Script
     'NUKE_EXECUTOR_SCRIPT_NAME',
     'NUKE_EXECUTOR_SCRIPT_PATH',
+
+    # Deadline Configuration
+    'DEADLINE_SERVER_ADDRESS',
+    'DEADLINE_SERVER_PORT',
+    'DEADLINE_USER',
+    'DEADLINE_PASSWORD',
 ]
