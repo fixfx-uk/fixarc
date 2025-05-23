@@ -38,8 +38,6 @@ import glob   # For finding Nuke scripts
 import shlex  # For parsing fixarc_options
 import tempfile # For Deadline job file creation
 from datetime import datetime
-import json
-import uuid # For generating unique IDs for farm submissions
 
 # --- Path Setup for Imports (BEFORE log object is fully configured) ---
 # This setup allows 'from fixarc.deadline...' and for 'fixarc.deadline' to find 'Deadline.api'.
@@ -402,73 +400,14 @@ def create_parser():
         help="Increase logging verbosity. -v for INFO (default for this script if not using fixfx.log), "
              "-vv for DEBUG. If using fixfx.log, this script respects its level but can be made more verbose."
     )
-
-    # --- Internal Arguments (for multi-stage farm processing) ---
-    # These are not meant for direct user invocation.
-    internal_group = parser.add_argument_group('Internal Farm Processing (DO NOT USE DIRECTLY)')
-    internal_group.add_argument(
-        "--_run-discovery-on-farm", action="store_true",
-        help=argparse.SUPPRESS # Hide from help
-    )
-    internal_group.add_argument(
-        "--_output-script-list", type=str, metavar="PATH",
-        help=argparse.SUPPRESS
-    )
-    internal_group.add_argument(
-        "--_run-archival-submission-on-farm", action="store_true",
-        help=argparse.SUPPRESS
-    )
-    internal_group.add_argument(
-        "--_input-script-list", type=str, metavar="PATH",
-        help=argparse.SUPPRESS
-    )
-    internal_group.add_argument(
-        "--_farm-submission-uuid", type=str, metavar="UUID", # To correlate logs/files if needed
-        help=argparse.SUPPRESS
-    )
-    # To pass original scope for Batch Name construction in the archival submission phase
-    internal_group.add_argument(
-        "--_original-project-name", type=str, help=argparse.SUPPRESS
-    )
-    internal_group.add_argument(
-        "--_original-mode", type=str, help=argparse.SUPPRESS # project, episode, sequence, shot
-    )
-    internal_group.add_argument(
-        "--_original-names-to-process", nargs='*', help=argparse.SUPPRESS
-    )
-    internal_group.add_argument(
-        "--_original-archive-root", type=str, help=argparse.SUPPRESS
-    )
-    internal_group.add_argument(
-        "--_original-client-config", type=str, help=argparse.SUPPRESS
-    )
-    internal_group.add_argument(
-        "--_original-fixarc-options", type=str, help=argparse.SUPPRESS
-    )
-    # We also need the original verbosity for the farm jobs
-    internal_group.add_argument(
-        "--_original-verbose", type=int, help=argparse.SUPPRESS
-    )
-
     return parser
-
-def _ensure_shared_dir_exists(shared_file_path: str):
-    """Ensures the directory for a shared file exists."""
-    dir_name = os.path.dirname(shared_file_path)
-    if dir_name: # Only if there is a directory part
-        try:
-            os.makedirs(dir_name, exist_ok=True)
-            log.debug(f"Ensured shared directory exists: {dir_name}")
-        except OSError as e:
-            log.error(f"Failed to create shared directory {dir_name}: {e}")
-            raise # Re-raise to halt if we can't create essential paths
 
 def main():
     """Main execution function for the fixarc-handler script.
 
     Parses command-line arguments, sets up logging, determines the operating mode
     and scripts to process, then either executes 'fixarc' locally or submits
-    jobs to a Deadline farm using a multi-stage approach.
+    jobs to a Deadline farm.
     """
     # --- Argument Parsing and Logging Setup ---
     parser = create_parser()
@@ -504,299 +443,68 @@ def main():
     log.debug(f"fixarc-handler: Effective logging level set to {logging.getLevelName(log.level)}.")
     log.debug(f"Parsed arguments: {args}")
 
-    # --- Determine Operating Mode and Target Names (needed early for batch name) ---
-    project_name = args.project_name_arg
-    mode = "project"
-    names_to_process = []
-    if args.episode: mode = "episode"; names_to_process = args.episode
-    elif args.sequence: mode = "sequence"; names_to_process = args.sequence
-    elif args.shot: mode = "shot"; names_to_process = args.shot
-
-    # --- Handle Different Execution Modes ---
-
-    if args._run_discovery_on_farm:
-        # FARM WORKER: Run script discovery and write to JSON file
-        log.info("[FARM DISCOVERY MODE] Starting Nuke script discovery.")
-        if not args._output_script_list:
-            log.error("[FARM DISCOVERY MODE] --_output-script-list not specified. Cannot proceed.")
-            sys.exit(1)
-
-        base_path_to_use = args.base_path # Should be passed through by the initial submitter
-        if not base_path_to_use:
-            fixstore_drive = os.environ.get("FIXSTORE_DRIVE")
-            if not fixstore_drive:
-                log.error("[FARM DISCOVERY MODE] Cannot determine base path. Set FIXSTORE_DRIVE or pass --base-path.")
-                sys.exit(1)
-            base_path_to_use = os.path.join(fixstore_drive, "proj")
-        base_path_to_use = os.path.normpath(base_path_to_use)
-        log.info(f"[FARM DISCOVERY MODE] Using base project path: {base_path_to_use}")
-
-        search_paths, _ = build_search_paths(mode, project_name, names_to_process, base_path_to_use)
-        found_scripts = find_and_filter_nuke_scripts(search_paths, args.max_versions)
-        
-        try:
-            _ensure_shared_dir_exists(args._output_script_list)
-            with open(args._output_script_list, 'w') as f_out:
-                json.dump(found_scripts, f_out, indent=2)
-            log.info(f"[FARM DISCOVERY MODE] Successfully wrote {len(found_scripts)} script paths to {args._output_script_list}")
-            sys.exit(0)
-        except Exception as e_json:
-            log.error(f"[FARM DISCOVERY MODE] Failed to write script list to {args._output_script_list}: {e_json}")
-            sys.exit(1)
-
-    elif args._run_archival_submission_on_farm:
-        # FARM WORKER: Read script list from JSON and submit individual fixarc jobs
-        log.info("[FARM ARCHIVAL SUBMISSION MODE] Starting individual 'fixarc' job submissions.")
-        if not args._input_script_list:
-            log.error("[FARM ARCHIVAL SUBMISSION MODE] --_input-script-list not specified. Cannot proceed.")
-            sys.exit(1)
-        
-        if not submit_deadline_job: # Crucial check
-             log.error("[FARM ARCHIVAL SUBMISSION MODE] Deadline module (submit_deadline_job) not available. Cannot submit archive jobs.")
-             sys.exit(1)
-
-        try:
-            with open(args._input_script_list, 'r') as f_in:
-                found_scripts_for_submission = json.load(f_in)
-            log.info(f"[FARM ARCHIVAL SUBMISSION MODE] Read {len(found_scripts_for_submission)} scripts from {args._input_script_list}")
-        except Exception as e_json_read:
-            log.error(f"[FARM ARCHIVAL SUBMISSION MODE] Failed to read script list from {args._input_script_list}: {e_json_read}")
-            sys.exit(1)
-
-        if not found_scripts_for_submission:
-            log.warning("[FARM ARCHIVAL SUBMISSION MODE] No scripts found in the list. Nothing to submit.")
-            sys.exit(0)
-
-        # --- Construct BatchName using original parameters passed through --_original-* args ---
-        original_proj_name = args._original_project_name or project_name # Fallback to current if not passed
-        original_mode = args._original_mode or mode
-        original_names = args._original_names_to_process or names_to_process
-        original_archive_root = args._original_archive_root or args.archive_root
-        original_client_config = args._original_client_config or args.client_config
-        original_fixarc_options_str = args._original_fixarc_options or args.fixarc_options
-        original_verbosity = args._original_verbose if args._original_verbose is not None else args.verbose
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        batch_name_parts = [f"fixarc - {timestamp} - {original_proj_name}"]
-        if original_mode == "episode" and original_names:
-            batch_name_parts.append(original_names[0])
-        elif original_mode == "sequence" and original_names:
-            seq_name_for_batch = original_names[0]
-            seq_parts = seq_name_for_batch.split('_')
-            if len(seq_parts) >= 2: batch_name_parts.append(f"{seq_parts[0]}_{seq_parts[1]}")
-            batch_name_parts.append(seq_name_for_batch)
-        batch_name_str = " - ".join(batch_name_parts)
-        batch_name_sanitized = "".join(c if c.isalnum() or c in ('_', '-', '.', ':', ' ') else '_' for c in batch_name_str).strip()
-        log.info(f"[FARM ARCHIVAL SUBMISSION MODE] Deadline Batch Name: {batch_name_sanitized}")
-
-        fixarc_python_script_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fixarc")
-        if not os.path.isfile(fixarc_python_script_path):
-            log.error(f"[FARM ARCHIVAL SUBMISSION MODE] Core 'fixarc' Python script not found: {fixarc_python_script_path}")
-            sys.exit(1)
-
-        success_submission_count = 0
-        failed_submission_count = 0
-        current_user_farm = os.environ.get('USER', os.environ.get('USERNAME', 'unknown_user'))
-
-        parsed_original_fixarc_options = shlex.split(original_fixarc_options_str) if original_fixarc_options_str else []
-
-        for i, script_path_farm in enumerate(found_scripts_for_submission):
-            script_norm_farm = os.path.normpath(script_path_farm)
-            script_basename_farm = os.path.basename(script_norm_farm)
-            log.info(f"--- Preparing Deadline job for script [{i+1}/{len(found_scripts_for_submission)}]: '{script_basename_farm}' ---")
-
-            # Derive Job Name (shot name)
-            shot_metadata_farm = {}
-            try:
-                from fixarc.utils import get_metadata_from_path
-                shot_metadata_farm = get_metadata_from_path(script_norm_farm)
-            except Exception as meta_e_farm:
-                log.warning(f"Could not get metadata for '{script_basename_farm}': {meta_e_farm}")
-            job_shot_name_farm = shot_metadata_farm.get("shot") or shot_metadata_farm.get("shot_name") or original_proj_name
-            if job_shot_name_farm == original_proj_name: # Fallback parsing
-                name_parts_farm = script_basename_farm.split('_')
-                if len(name_parts_farm) >= 4: job_shot_name_farm = "_".join(name_parts_farm[:4])
-            
-            # Arguments for the 'fixarc' core script
-            current_fixarc_cmd_args_farm = [
-                fixarc_python_script_path,
-                script_norm_farm,
-                "--archive-root", original_archive_root # Use original archive root
-            ]
-            if original_verbosity >= 2: current_fixarc_cmd_args_farm.append("-vv")
-            elif original_verbosity == 1: current_fixarc_cmd_args_farm.append("-v")
-            if original_client_config:
-                if not os.path.isfile(original_client_config):
-                    log.error(f"Client config '{original_client_config}' not found. Skipping: {script_basename_farm}")
-                    failed_submission_count += 1; continue
-                current_fixarc_cmd_args_farm.extend(["--client-config", original_client_config])
-            if parsed_original_fixarc_options: # Already parsed list
-                current_fixarc_cmd_args_farm.extend(parsed_original_fixarc_options)
-
-            fixarc_args_str_farm = ' '.join(f'{shlex.quote(arg)}' for arg in current_fixarc_cmd_args_farm)
-
-            deadline_job_info_farm = {
-                "Plugin": "CommandLine",
-                "Name": str(job_shot_name_farm),
-                "BatchName": batch_name_sanitized,
-                "Comment": f"Archive {script_norm_farm} via fixarc for project {original_proj_name}",
-                "UserName": current_user_farm,
-                "Frames": "0",
-                "InitialStatus": "Active",
-                "MachineLimit": 1,
-                "Executable": sys.executable,
-                "Arguments": fixarc_args_str_farm
-            }
-            try:
-                job_id_farm = submit_deadline_job(job_info=deadline_job_info_farm)
-                if job_id_farm: log.info(f"  Submitted job for {script_basename_farm}. ID: {job_id_farm}"); success_submission_count += 1
-                else: log.error(f"  Failed to submit job for {script_basename_farm}."); failed_submission_count += 1
-            except Exception as e_submit_farm:
-                log.error(f"  Error submitting job for {script_basename_farm}: {e_submit_farm}", exc_info=True); failed_submission_count += 1
-            log.info("------------------------------")
-        
-        log.info(f"[FARM ARCHIVAL SUBMISSION MODE] Finished. Submitted: {success_submission_count}, Failed: {failed_submission_count}")
-        sys.exit(0 if failed_submission_count == 0 else 1)
-
-    # --- Standard Local Execution or Initial Farm Submission --- 
+    # --- Locate Essential Commands ---
     current_script_dir = os.path.dirname(os.path.realpath(__file__))
     fixarc_cmd_path = get_command_path("fixarc", is_essential=True, relative_fallback_search_dirs=[current_script_dir])
-    log.info(f"Using 'fixarc' command for local execution (if not farm) or as reference: {fixarc_cmd_path}")
+    log.info(f"Using 'fixarc' command: {fixarc_cmd_path}")
 
-    # Determine Base Path for Project Structure (needed for initial discovery job or local run)
+    if args.farm:
+        if not submit_deadline_job:
+            log.error("Farm submission requested but Deadline module not available.")
+            sys.exit(1)
+        else:
+            log.info("Farm submission via Deadline Python API will be used.")
+
+    # --- Determine Operating Mode and Target Names ---
+    project_name = args.project_name_arg # Get project name from the general --project argument
+
+    mode = "project" # Default mode: process the whole project
+    names_to_process = [] # List of specific episodes, sequences, or shots
+
+    if args.episode:
+        mode = "episode"
+        names_to_process = args.episode
+    elif args.sequence:
+        mode = "sequence"
+        names_to_process = args.sequence
+    elif args.shot:
+        mode = "shot"
+        names_to_process = args.shot
+    # If none of the above (episode, sequence, shot) are specified, 
+    # the mode remains "project" and names_to_process remains empty,
+    # indicating processing for the entire project_name.
+    
+    log.info(f"Operating Mode: {mode}")
+    log.info(f"Project Name: {project_name}")
+    if names_to_process:
+        log.info(f"Names to process: {names_to_process}")
+    log.info(f"Archive Root: {args.archive_root}")
+
+    # --- Determine Base Path for Project Structure ---
     base_path_to_use = args.base_path
     if not base_path_to_use:
+        # If --base-path is not provided, attempt to use FIXSTORE_DRIVE environment variable.
         fixstore_drive = os.environ.get("FIXSTORE_DRIVE")
         if not fixstore_drive:
-            log.error("Cannot determine default base path. Set FIXSTORE_DRIVE or use --base-path.")
+            log.error("Cannot determine default base path. "
+                      "Please set the FIXSTORE_DRIVE environment variable (e.g., 'W:' or '/mnt/fixstore') "
+                      "or use the --base-path argument.")
             sys.exit(1)
-        base_path_to_use = os.path.join(fixstore_drive, "proj")
+        base_path_to_use = os.path.join(fixstore_drive, "proj") # Standard convention: $FIXSTORE_DRIVE/proj
+    
+    # Normalize the path (e.g., converts slashes, resolves '..') for consistency.
     base_path_to_use = os.path.normpath(base_path_to_use)
     log.info(f"Using base project path: {base_path_to_use}")
 
-    if args.farm:
-        # LOCAL: This is the initial invocation by the user with --farm
-        log.info("[FARM MODE - LOCAL INVOCATION] Submitting multi-stage farm processing pipeline.")
-        if not submit_deadline_job:
-            log.error("Farm submission requested but Deadline module not available. Cannot initiate farm pipeline.")
-            sys.exit(1)
-
-        farm_submission_uuid = str(uuid.uuid4())
-        # TODO: Define a shared path for the script list. This needs to be accessible by farm workers.
-        # Example: args.archive_root / ".fixarc_farm_temp" / farm_submission_uuid / "discovered_scripts.json"
-        # For now, using a path relative to archive_root (ensure archive_root is accessible from farm)
-        shared_temp_dir_name = ".fixarc_farm_temp"
-        shared_script_list_filename = f"scripts_{farm_submission_uuid}.json"
-        # Construct path based on archive_root which should be a shared location
-        # Ensure archive_root itself is valid and accessible before forming this path.
-        if not os.path.isdir(args.archive_root):
-            try:
-                os.makedirs(args.archive_root, exist_ok=True)
-                log.info(f"Created archive root directory: {args.archive_root}")
-            except OSError as e_mkdir:
-                log.error(f"Archive root '{args.archive_root}' does not exist and could not be created: {e_mkdir}")
-                log.error("Cannot determine shared path for farm processing. Ensure archive_root is a valid, accessible shared location.")
-                sys.exit(1)
-        
-        shared_script_list_path = os.path.join(args.archive_root, shared_temp_dir_name, shared_script_list_filename)
-        _ensure_shared_dir_exists(shared_script_list_path)
-        log.info(f"Shared script list for farm will be at: {shared_script_list_path}")
-
-        # Job 1: Discovery on Farm
-        discovery_job_name = f"FixArc_Discovery_{project_name}_{farm_submission_uuid[:8]}"
-        discovery_args_list = [
-            sys.executable,
-            os.path.realpath(__file__), # This script
-            "--project", project_name,
-            "--base-path", base_path_to_use,
-            "--max-versions", str(args.max_versions),
-            "--_run-discovery-on-farm",
-            "--_output-script-list", shared_script_list_path,
-            "--_farm-submission-uuid", farm_submission_uuid
-        ]
-        if args.episode: discovery_args_list.extend(["--episode"] + args.episode)
-        elif args.sequence: discovery_args_list.extend(["--sequence"] + args.sequence)
-        elif args.shot: discovery_args_list.extend(["--shot"] + args.shot)
-        if args.verbose >= 2: discovery_args_list.append("-vv")
-        elif args.verbose == 1: discovery_args_list.append("-v")
-        
-        discovery_job_info = {
-            "Plugin": "CommandLine",
-            "Name": discovery_job_name,
-            "Comment": f"Discover Nuke scripts for {project_name}",
-            "UserName": current_user,
-            "Frames": "0",
-            "InitialStatus": "Active",
-            "Executable": discovery_args_list[0], # python.exe
-            "Arguments": ' '.join(f'{shlex.quote(arg)}' for arg in discovery_args_list[1:])
-        }
-        log.info(f"Submitting Discovery Job to Deadline: {discovery_job_name}")
-        discovery_job_id = submit_deadline_job(job_info=discovery_job_info)
-
-        if not discovery_job_id:
-            log.error("Failed to submit Discovery Job to Deadline. Halting farm submission.")
-            sys.exit(1)
-        log.info(f"Discovery Job submitted. ID: {discovery_job_id}")
-
-        # Job 2: Archival Submission on Farm (depends on Job 1)
-        archival_submit_job_name = f"FixArc_SubmitArchives_{project_name}_{farm_submission_uuid[:8]}"
-        archival_submit_args_list = [
-            sys.executable,
-            os.path.realpath(__file__), # This script
-            "--_run-archival-submission-on-farm",
-            "--_input-script-list", shared_script_list_path,
-            "--_farm-submission-uuid", farm_submission_uuid,
-            # Pass original args for batch name and individual job construction
-            "--_original-project-name", project_name,
-            "--_original-mode", mode,
-            "--_original-archive-root", args.archive_root # Crucial for archive path
-        ]
-        if names_to_process: archival_submit_args_list.extend(["--_original-names-to-process"] + names_to_process)
-        if args.client_config: archival_submit_args_list.extend(["--_original-client-config", args.client_config])
-        if args.fixarc_options: archival_submit_args_list.extend(["--_original-fixarc-options", args.fixarc_options])
-        archival_submit_args_list.extend(["--_original-verbose", str(args.verbose)]) # Pass verbosity
-        if args.verbose >= 2: archival_submit_args_list.append("-vv") # Set verbosity for this job itself too
-        elif args.verbose == 1: archival_submit_args_list.append("-v")
-
-        archival_submit_job_info = {
-            "Plugin": "CommandLine",
-            "Name": archival_submit_job_name,
-            "Comment": f"Submit individual archive jobs for {project_name} based on discovered scripts",
-            "UserName": current_user,
-            "Frames": "0",
-            "JobDependencies": discovery_job_id, # Depends on discovery job
-            "InitialStatus": "Active", # Will be Suspended if dep is not complete, then Active
-            "Executable": archival_submit_args_list[0],
-            "Arguments": ' '.join(f'{shlex.quote(arg)}' for arg in archival_submit_args_list[1:])
-        }
-        log.info(f"Submitting Archival Submission Job to Deadline: {archival_submit_job_name}")
-        archival_submit_job_id = submit_deadline_job(job_info=archival_submit_job_info)
-
-        if not archival_submit_job_id:
-            log.error("Failed to submit Archival Submission Job to Deadline.")
-            # Note: Discovery job is already queued. Manual cleanup might be needed in Deadline.
-            sys.exit(1)
-        
-        log.info(f"Archival Submission Job submitted. ID: {archival_submit_job_id}")
-        log.info("Farm processing pipeline successfully submitted. Monitor Deadline for progress.")
-        sys.exit(0) # Local handler exits after successfully queuing the farm pipeline
-
-    # --- LOCAL EXECUTION (No --farm, or --farm handled above) ---
-    # This part runs if not --farm, or if it's a farm worker in a later stage (but those exit earlier)
-    log.info(f"Operating Mode: {mode}")
-    log.info(f"Project Name: {project_name}")
-    if names_to_process: log.info(f"Names to process: {names_to_process}")
-    log.info(f"Archive Root: {args.archive_root}")
-
-    # --- Find Nuke Scripts (Only for local execution now) ---
-    # For farm, discovery happens in a separate farm job.
+    # --- Find Nuke Scripts ---
     search_paths, missing_search_roots = build_search_paths(mode, project_name, names_to_process, base_path_to_use)
 
     if not search_paths:
         log.error("No valid search paths could be determined to find Nuke scripts based on inputs.")
         if missing_search_roots:
             log.error("The following expected directories were missing or inaccessible:")
-            for missing_path in missing_search_roots: log.error(f"  - {missing_path}")
+            for missing_path in missing_search_roots:
+                log.error(f"  - {missing_path}")
         sys.exit(1)
 
     found_scripts = find_and_filter_nuke_scripts(search_paths, args.max_versions)
@@ -805,83 +513,238 @@ def main():
         log.error("Process halting: No Nuke scripts were found to process with the given criteria.")
         if missing_search_roots: # Remind user if some paths were unsearchable
             log.warning("Note: The following expected directories were missing and could not be searched:")
-            for missing_path in missing_search_roots: log.warning(f"  - {missing_path}")
+            for missing_path in missing_search_roots:
+                log.warning(f"  - {missing_path}")
         sys.exit(1) # Exit if no scripts are found.
 
+    # If some directories were missing but scripts were still found elsewhere, prompt user to continue.
     if missing_search_roots:
         log.warning("Warning: Some expected source directories were missing during the Nuke script search:")
-        for missing_path in missing_search_roots: log.warning(f"  - {missing_path}")
+        for missing_path in missing_search_roots:
+            log.warning(f"  - {missing_path}")
         try:
+            # Python's input() for user confirmation.
             user_response = input("Do you want to continue archiving the scripts that were found? (y/N) ").strip().lower()
-            if user_response != 'y': log.info("User aborted operation."); sys.exit(3)
-        except EOFError: log.warning("Non-interactive. Aborting due to missing dirs."); sys.exit(3)
+            if user_response != 'y':
+                log.info("User aborted operation due to missing directories.")
+                sys.exit(3) # Exit code 3 for user abort.
+        except EOFError: # Handle non-interactive environments (e.g., automated scripts)
+            log.warning("Non-interactive environment detected. Cannot prompt for confirmation about missing directories. "
+                        "Aborting as a safety measure.")
+            sys.exit(3) # Abort in non-interactive if directories are missing.
 
+    # Parse --fixarc-options string into a list of arguments
     parsed_fixarc_options = []
     if args.fixarc_options:
-        try: parsed_fixarc_options = shlex.split(args.fixarc_options)
-        except Exception as e_shlex: log.error(f"Error parsing --fixarc-options: {e_shlex}")
-    
+        try:
+            # shlex.split is used for proper parsing of quoted strings within the options.
+            parsed_fixarc_options = shlex.split(args.fixarc_options)
+            log.debug(f"Parsed --fixarc-options: {parsed_fixarc_options}")
+        except Exception as e:
+            log.error(f"Error parsing --fixarc-options string: '{args.fixarc_options}'. Error: {e}")
+            log.warning("Proceeding without additional fixarc options due to parsing error.")
+            # Continue with an empty list if parsing fails.
+
+    # --- Process Found Scripts (Local Execution or Farm Submission) ---
     success_count = 0
     fail_count = 0
-    failed_script_details = []
+    failed_script_details = [] # New list to store details of failed scripts
+    try:
+        current_user = os.getlogin()
+    except OSError: # os.getlogin() can fail in some non-interactive/daemonized environments
+        current_user = os.environ.get('USER', os.environ.get('USERNAME', 'unknown_user'))
 
-    # --- LOCAL Script Processing Loop (Only runs if NOT --farm initial call) ---
-    # The farm logic was handled above and exits. This loop is for local execution only.
-    log.info(f"[LOCAL EXECUTION] Starting archival process for {len(found_scripts)} Nuke script(s)...")
-    for i, script_path in enumerate(found_scripts):
-        script_norm = os.path.normpath(script_path)
-        script_basename = os.path.basename(script_norm)
-        log.info(f"--- Processing script [{i+1}/{len(found_scripts)}]: '{script_basename}' ---")
+    total_scripts = len(found_scripts)
+    log.info(f"Starting archival process for {total_scripts} Nuke script(s)...")
 
-        base_cmd_args = [fixarc_cmd_path, script_norm, "--archive-root", args.archive_root]
-        if args.verbose >= 2: base_cmd_args.append("-vv")
-        elif args.verbose == 1: base_cmd_args.append("-v")
-        if args.client_config:
-            if not os.path.isfile(args.client_config): log.error(f"Client config '{args.client_config}' not found. Skipping: {script_basename}"); fail_count +=1; continue
-            base_cmd_args.extend(["--client-config", args.client_config])
-        if parsed_fixarc_options: base_cmd_args.extend(parsed_fixarc_options)
+    if args.farm:
+        # --- Farm Submission Logic ---
+        if not submit_deadline_job:
+            log.error("Farm submission requested but Deadline module (submit_deadline_job) not available.")
+            log.error("Cannot proceed with farm submission.")
+            sys.exit(1) # Exit if farm submission is impossible
 
-        log.info(f"Executing 'fixarc' locally for {script_basename}...")
-        try:
-            process = subprocess.run(base_cmd_args, check=True, text=True, encoding='utf-8', capture_output=True)
-            log.info(f"Successfully archived: {script_basename}")
-            if process.stdout.strip(): log.debug(f"  fixarc stdout:\n{process.stdout.strip()}")
-            success_count += 1
-        except subprocess.CalledProcessError as e:
-            log.error(f"'fixarc' command FAILED for: {script_basename} (Exit code: {e.returncode})")
-            failed_script_details.append({"name": script_basename, "returncode": e.returncode, "stderr": e.stderr.strip() if e.stderr else "No stderr."})
-            if e.stdout.strip(): log.warning(f"  fixarc stdout on error:\n{e.stdout.strip()}")
-            if e.stderr.strip(): log.warning(f"  fixarc stderr on error:\n{e.stderr.strip()}")
-            fail_count += 1
-        except FileNotFoundError: 
-            log.error(f"Critical error: 'fixarc' command not found at {fixarc_cmd_path}. Halting for {script_basename}.")
-            failed_script_details.append({"name": script_basename, "returncode": -1, "stderr": f"'fixarc' not found at {fixarc_cmd_path}."})
-            fail_count += 1 
-        log.info("------------------------------")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Construct BatchName
+        batch_name_parts = [f"fixarc - {timestamp} - {project_name}"]
+        if mode == "episode" and names_to_process:
+            batch_name_parts.append(names_to_process[0])
+        elif mode == "sequence" and names_to_process:
+            # Try to infer episode from sequence for a more complete batch name
+            # Example: seq "PROJ_ep01_sc010" -> episode "PROJ_ep01"
+            seq_name_for_batch = names_to_process[0]
+            seq_parts = seq_name_for_batch.split('_')
+            if len(seq_parts) >= 2: # project_episode
+                inferred_episode_for_batch = f"{seq_parts[0]}_{seq_parts[1]}"
+                batch_name_parts.append(inferred_episode_for_batch)
+            batch_name_parts.append(seq_name_for_batch)
+        
+        batch_name_str = " - ".join(batch_name_parts)
+        # Sanitize BatchName for Deadline
+        batch_name_sanitized = "".join(c if c.isalnum() or c in ('_', '-', '.', ':', ' ') else '_' for c in batch_name_str).strip()
+        log.info(f"Deadline Batch Name: {batch_name_sanitized}")
 
-    # --- Final Summary (for local execution) ---
-    log.info("--- Archiving Process Summary (Local Execution) ---")
-    log.info(f"Local 'fixarc' execution complete.")
-    log.info(f"Scripts successfully archived: {success_count}")
-    log.info(f"Scripts failed to archive: {fail_count}")
-    # (Error details logging as before)
-    if failed_script_details:
-        log.error("--- Details of Failed Scripts ---")
-        for failure in failed_script_details:
-            log.error(f"  Script: {failure['name']}")
-            error_lines = failure['stderr'].splitlines()
-            concise_error = "\n".join(error_lines[-5:])
-            if not concise_error and failure['stderr']: concise_error = failure['stderr'][:300] + ('...' if len(failure['stderr']) > 300 else '')
-            log.error(f"    Exit Code: {failure['returncode']}")
-            log.error(f"    Error Snippet: {concise_error if concise_error else 'No specific error message captured in stderr.'}")
-            log.debug(f"    Full stderr for {failure['name']}:\n{failure['stderr']}")
+        # Path to the actual 'fixarc' Python script (not the .BAT wrapper)
+        # Assuming 'fixarc' (python script) is in the same directory as 'fixarc-handler'
+        fixarc_python_script_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fixarc")
+        if not os.path.isfile(fixarc_python_script_path):
+            log.error(f"Core 'fixarc' Python script not found at expected location: {fixarc_python_script_path}")
+            log.error("Cannot proceed with farm submission.")
+            sys.exit(1)
 
-    if missing_search_roots: # Remind user at the end as well
+        for i, script_path in enumerate(found_scripts):
+            script_norm = os.path.normpath(script_path)
+            script_basename = os.path.basename(script_norm)
+            log.info(f"--- Preparing Deadline job for script [{i+1}/{total_scripts}]: '{script_basename}' ---")
+
+            # Derive shot_name for Deadline Job Name
+            # Attempt to get metadata for the specific script to extract shot name
+            shot_metadata = {}
+            try:
+                from fixarc.utils import get_metadata_from_path # Local import for clarity
+                shot_metadata = get_metadata_from_path(script_norm)
+            except Exception as meta_e:
+                log.warning(f"Could not get detailed metadata for script '{script_basename}' to determine shot name: {meta_e}")
+            
+            job_shot_name = shot_metadata.get("shot") or \
+                            shot_metadata.get("shot_name") or \
+                            project_name # Fallback to project name if shot cannot be derived
+
+            # Further fallback: try to parse from basename if metadata fails
+            if job_shot_name == project_name:
+                # Basic parsing: BOB_104_0B5_010_BLU_Comp_v005.nk -> BOB_104_0B5_010_BLU
+                name_parts = script_basename.split('_')
+                if len(name_parts) >= 4: # Proj_Ep_Seq_Shot
+                    job_shot_name = "_".join(name_parts[:4])
+
+
+            # Construct base command arguments for 'fixarc' (the Python script)
+            # These will be passed to 'python.exe <fixarc_python_script_path> ...'
+            current_fixarc_cmd_args = [
+                fixarc_python_script_path,
+                script_norm,
+                "--archive-root", args.archive_root
+            ]
+            if args.verbose >= 2: current_fixarc_cmd_args.append("-vv")
+            elif args.verbose == 1: current_fixarc_cmd_args.append("-v")
+            if args.client_config:
+                if not os.path.isfile(args.client_config):
+                    log.error(f"Client config file not found: {args.client_config}. Skipping farm job for: {script_basename}")
+                    fail_count += 1
+                    continue
+                current_fixarc_cmd_args.extend(["--client-config", args.client_config])
+            if parsed_fixarc_options:
+                current_fixarc_cmd_args.extend(parsed_fixarc_options)
+            
+            # For Deadline API, arguments should be a string for CommandLine plugin.
+            # Arguments start from the script path, not including 'python.exe'
+            fixarc_arguments_str = ' '.join(f'{shlex.quote(arg)}' for arg in current_fixarc_cmd_args)
+
+            deadline_job_info = {
+                "Plugin": "CommandLine",
+                "Name": str(job_shot_name), # Deadline Job Name is the shot
+                "BatchName": batch_name_sanitized, # Group jobs by this batch name
+                "Comment": f"Archive {script_norm} via fixarc-handler for project {project_name}",
+                "UserName": current_user,
+                "Frames": "0", # Single task job for this specific script
+                "InitialStatus": "Active",
+                "MachineLimit": 1, # One machine per script archival
+                "Executable": sys.executable, # Full path to python.exe
+                "Arguments": fixarc_arguments_str # Arguments for 'fixarc' python script
+            }
+            
+            log.info(f"  Submitting job to Deadline: Name='{job_shot_name}', Batch='{batch_name_sanitized}'")
+            log.debug(f"  Job Executable: {sys.executable}")
+            log.debug(f"  Job Arguments: {fixarc_arguments_str}")
+            
+            try:
+                job_id = submit_deadline_job(job_info=deadline_job_info)
+                if job_id:
+                    log.info(f"  Successfully submitted job for {script_basename} to Deadline. Job ID: {job_id}")
+                    success_count += 1
+                else:
+                    log.error(f"  Failed to submit job for {script_basename} to Deadline via Python API.")
+                    fail_count += 1
+            except Exception as e:
+                log.error(f"  An unexpected error occurred during Deadline job submission for {script_basename}: {e}", exc_info=True)
+                fail_count += 1
+            log.info("------------------------------")
+
+    else:
+        # --- Local Execution Logic (remains largely the same) ---
+        for i, script_path in enumerate(found_scripts):
+            script_norm = os.path.normpath(script_path)
+            script_basename = os.path.basename(script_norm)
+            log.info(f"--- Processing script [{i+1}/{total_scripts}]: '{script_basename}' ---")
+
+            # Construct the base command for 'fixarc' (this uses fixarc_cmd_path which could be .BAT)
+            base_cmd_args = [fixarc_cmd_path, script_norm, "--archive-root", args.archive_root]
+            
+            if args.verbose >= 2: base_cmd_args.append("-vv")
+            elif args.verbose == 1: base_cmd_args.append("-v")
+            if args.client_config:
+                if not os.path.isfile(args.client_config):
+                    log.error(f"Client config file not found: {args.client_config}. Skipping: {script_basename}")
+                    fail_count +=1; continue
+                base_cmd_args.extend(["--client-config", args.client_config])
+            if parsed_fixarc_options: base_cmd_args.extend(parsed_fixarc_options)
+
+            log.info(f"Executing 'fixarc' locally for {script_basename}...")
+            try:
+                process = subprocess.run(base_cmd_args, check=True, text=True, encoding='utf-8', capture_output=True)
+                log.info(f"Successfully archived: {script_basename}")
+                if process.stdout.strip(): log.debug(f"  fixarc stdout:\\n{process.stdout.strip()}")
+                success_count += 1
+            except subprocess.CalledProcessError as e:
+                log.error(f"'fixarc' command FAILED for: {script_basename} (Exit code: {e.returncode})")
+                failed_script_details.append({"name": script_basename, "returncode": e.returncode, "stderr": e.stderr.strip() if e.stderr else "No stderr."})
+                if e.stdout.strip(): log.warning(f"  fixarc stdout on error:\\n{e.stdout.strip()}")
+                if e.stderr.strip(): log.warning(f"  fixarc stderr on error:\\n{e.stderr.strip()}")
+                fail_count += 1
+            except FileNotFoundError: 
+                log.error(f"Critical error: 'fixarc' command not found at {fixarc_cmd_path}. Halting for {script_basename}.")
+                failed_script_details.append({"name": script_basename, "returncode": -1, "stderr": f"'fixarc' not found at {fixarc_cmd_path}."})
+                fail_count += 1 
+            log.info("------------------------------")
+
+    # --- Final Summary ---
+    log.info("--- Archiving Process Summary ---")
+    if args.farm:
+        log.info(f"Deadline job submission process complete.")
+        log.info(f"Jobs successfully submitted to Deadline: {success_count}")
+        log.info(f"Jobs failed to submit to Deadline: {fail_count}")
+        log.info("Note: Check Deadline Monitor for the actual completion status and detailed logs of submitted jobs.")
+    else:
+        log.info(f"Local 'fixarc' execution complete.")
+        log.info(f"Scripts successfully archived: {success_count}")
+        log.info(f"Scripts failed to archive: {fail_count}")
+        if failed_script_details:
+            log.error("--- Details of Failed Scripts ---")
+            for failure in failed_script_details:
+                log.error(f"  Script: {failure['name']}")
+                # Attempt to get a concise error message, e.g., last few lines of stderr
+                error_lines = failure['stderr'].splitlines()
+                concise_error = "\n".join(error_lines[-5:]) # Last 5 lines, or fewer if less
+                if not concise_error and failure['stderr']: # if last 5 lines are empty but there is stderr
+                    concise_error = failure['stderr'][:300] + ('...' if len(failure['stderr']) > 300 else '')
+
+
+                log.error(f"    Exit Code: {failure['returncode']}")
+                log.error(f"    Error Snippet: {concise_error if concise_error else 'No specific error message captured in stderr.'}")
+                log.debug(f"    Full stderr for {failure['name']}:\n{failure['stderr']}") # Log full for debug
+
+    if missing_search_roots: # Remind user at the end as well if some directories were not found
         log.warning("Reminder: Some expected source directories were missing during the search process:")
-        for missing_path in missing_search_roots: log.warning(f"  - {missing_path}")
+        for missing_path in missing_search_roots:
+            log.warning(f"  - {missing_path}")
 
-    if fail_count > 0: log.info("fixarc-handler finished with errors."); sys.exit(1)
-    else: log.info("fixarc-handler finished successfully."); sys.exit(0)
+    if fail_count > 0:
+        log.info("fixarc-handler finished with errors.")
+        sys.exit(1) # Exit with error code 1 if any failures occurred.
+    else:
+        log.info("fixarc-handler finished successfully.")
+        sys.exit(0) # Exit with success code 0.
 
 if __name__ == "__main__":
     # This ensures main() is called only when the script is executed directly.
