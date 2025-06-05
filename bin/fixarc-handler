@@ -681,6 +681,9 @@ def main():
             log.error("Farm submission requested but Deadline module not available. Cannot initiate farm pipeline.")
             sys.exit(1)
 
+        # Get current user for Deadline job submission
+        current_user = os.environ.get('USER', os.environ.get('USERNAME', 'unknown_user'))
+
         farm_submission_uuid = str(uuid.uuid4())
         # TODO: Define a shared path for the script list. This needs to be accessible by farm workers.
         # Example: args.archive_root / ".fixarc_farm_temp" / farm_submission_uuid / "discovered_scripts.json"
@@ -828,60 +831,76 @@ def main():
     # --- LOCAL Script Processing Loop (Only runs if NOT --farm initial call) ---
     # The farm logic was handled above and exits. This loop is for local execution only.
     log.info(f"[LOCAL EXECUTION] Starting archival process for {len(found_scripts)} Nuke script(s)...")
-        for i, script_path in enumerate(found_scripts):
-            script_norm = os.path.normpath(script_path)
-            script_basename = os.path.basename(script_norm)
+    
+    for i, script_path in enumerate(found_scripts):
+        script_norm = os.path.normpath(script_path)
+        script_basename = os.path.basename(script_norm)
         log.info(f"--- Processing script [{i+1}/{len(found_scripts)}]: '{script_basename}' ---")
-            
-            base_cmd_args = [fixarc_cmd_path, script_norm, "--archive-root", args.archive_root]
-        if args.verbose >= 2: base_cmd_args.append("-vv")
-        elif args.verbose == 1: base_cmd_args.append("-v")
-            if args.client_config:
-            if not os.path.isfile(args.client_config): log.error(f"Client config '{args.client_config}' not found. Skipping: {script_basename}"); fail_count +=1; continue
-                base_cmd_args.extend(["--client-config", args.client_config])
-        if parsed_fixarc_options: base_cmd_args.extend(parsed_fixarc_options)
+        
+        base_cmd_args = [fixarc_cmd_path, script_norm, "--archive-root", args.archive_root]
+        if args.verbose >= 2: 
+            base_cmd_args.append("-vv")
+        elif args.verbose == 1: 
+            base_cmd_args.append("-v")
+        if args.client_config:
+            if not os.path.isfile(args.client_config): 
+                log.error(f"Client config '{args.client_config}' not found. Skipping: {script_basename}")
+                fail_count += 1
+                continue
+            base_cmd_args.extend(["--client-config", args.client_config])
+        if parsed_fixarc_options: 
+            base_cmd_args.extend(parsed_fixarc_options)
 
-                log.info(f"Executing 'fixarc' locally for {script_basename}...") 
-                try:
-                    process = subprocess.run(base_cmd_args, check=True, text=True, encoding='utf-8', capture_output=True)
-                    log.info(f"Successfully archived: {script_basename}")
-            if process.stdout.strip(): log.debug(f"  fixarc stdout:\n{process.stdout.strip()}")
-                    success_count += 1
-                except subprocess.CalledProcessError as e:
-                    log.error(f"'fixarc' command FAILED for: {script_basename} (Exit code: {e.returncode})")
+        log.info(f"Executing 'fixarc' locally for {script_basename}...") 
+        try:
+            process = subprocess.run(base_cmd_args, check=True, text=True, encoding='utf-8', capture_output=True)
+            log.info(f"Successfully archived: {script_basename}")
+            if process.stdout.strip(): 
+                log.debug(f"  fixarc stdout:\n{process.stdout.strip()}")
+            success_count += 1
+        except subprocess.CalledProcessError as e:
+            log.error(f"'fixarc' command FAILED for: {script_basename} (Exit code: {e.returncode})")
             failed_script_details.append({"name": script_basename, "returncode": e.returncode, "stderr": e.stderr.strip() if e.stderr else "No stderr."})
-            if e.stdout.strip(): log.warning(f"  fixarc stdout on error:\n{e.stdout.strip()}")
-            if e.stderr.strip(): log.warning(f"  fixarc stderr on error:\n{e.stderr.strip()}")
-                    fail_count += 1
-                except FileNotFoundError: 
+            if e.stdout.strip(): 
+                log.warning(f"  fixarc stdout on error:\n{e.stdout.strip()}")
+            if e.stderr.strip(): 
+                log.warning(f"  fixarc stderr on error:\n{e.stderr.strip()}")
+            fail_count += 1
+        except FileNotFoundError: 
             log.error(f"Critical error: 'fixarc' command not found at {fixarc_cmd_path}. Halting for {script_basename}.")
             failed_script_details.append({"name": script_basename, "returncode": -1, "stderr": f"'fixarc' not found at {fixarc_cmd_path}."})
-                    fail_count += 1 
+            fail_count += 1 
         log.info("------------------------------")
 
     # --- Final Summary (for local execution) ---
     log.info("--- Archiving Process Summary (Local Execution) ---")
-        log.info(f"Local 'fixarc' execution complete.")
-        log.info(f"Scripts successfully archived: {success_count}")
-        log.info(f"Scripts failed to archive: {fail_count}")
+    log.info(f"Local 'fixarc' execution complete.")
+    log.info(f"Scripts successfully archived: {success_count}")
+    log.info(f"Scripts failed to archive: {fail_count}")
     # (Error details logging as before)
-        if failed_script_details:
-            log.error("--- Details of Failed Scripts ---")
-            for failure in failed_script_details:
-                log.error(f"  Script: {failure['name']}")
-                error_lines = failure['stderr'].splitlines()
+    if failed_script_details:
+        log.error("--- Details of Failed Scripts ---")
+        for failure in failed_script_details:
+            log.error(f"  Script: {failure['name']}")
+            error_lines = failure['stderr'].splitlines()
             concise_error = "\n".join(error_lines[-5:])
-            if not concise_error and failure['stderr']: concise_error = failure['stderr'][:300] + ('...' if len(failure['stderr']) > 300 else '')
-                log.error(f"    Exit Code: {failure['returncode']}")
-                log.error(f"    Error Snippet: {concise_error if concise_error else 'No specific error message captured in stderr.'}")
+            if not concise_error and failure['stderr']: 
+                concise_error = failure['stderr'][:300] + ('...' if len(failure['stderr']) > 300 else '')
+            log.error(f"    Exit Code: {failure['returncode']}")
+            log.error(f"    Error Snippet: {concise_error if concise_error else 'No specific error message captured in stderr.'}")
             log.debug(f"    Full stderr for {failure['name']}:\n{failure['stderr']}")
 
     if missing_search_roots: # Remind user at the end as well
         log.warning("Reminder: Some expected source directories were missing during the search process:")
-        for missing_path in missing_search_roots: log.warning(f"  - {missing_path}")
+        for missing_path in missing_search_roots: 
+            log.warning(f"  - {missing_path}")
 
-    if fail_count > 0: log.info("fixarc-handler finished with errors."); sys.exit(1)
-    else: log.info("fixarc-handler finished successfully."); sys.exit(0)
+    if fail_count > 0: 
+        log.info("fixarc-handler finished with errors.")
+        sys.exit(1)
+    else: 
+        log.info("fixarc-handler finished successfully.")
+        sys.exit(0)
 
 if __name__ == "__main__":
     # This ensures main() is called only when the script is executed directly.
