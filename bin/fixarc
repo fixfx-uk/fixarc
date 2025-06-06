@@ -50,7 +50,7 @@ def main():
         # --- Bootstrap fixenv environment ---
         try:
             # Check for config file existence before running fixe
-            config_path = fixenv.CONFIG_PATH
+            config_path = fixenv.STUDIO_ENV_CONFIG_PATH
             log.info(f"Looking for studio config at: {config_path}")
             if os.path.exists(config_path):
                 log.info(f"Found studio_config.json, checking content...")
