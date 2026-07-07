@@ -26,6 +26,12 @@ from fixarc.exceptions import (
 from fixfx.data.studio_data import StudioData
 
 
+DEFAULT_INGEST_SETTINGS_CANDIDATES = (
+    "/mnt/pipe/Project_settings/ingest_settings.yaml",
+    "Z:/pipe/Project_settings/ingest_settings.yaml",
+)
+
+
 # --- Path Manipulation & Validation ---
 def validate_path_exists(path: str, context: str = "Dependency") -> None:
     """Checks if a file or sequence directory exists. Raises DependencyError if not."""
@@ -201,10 +207,12 @@ log.info(f"Nuke Executor Script Path: {constants.NUKE_EXECUTOR_SCRIPT_PATH.absol
 def execute_nuke_archive_process(
     input_script_path: str,
     archive_root: str,
-    final_script_archive_path: str,
+    final_script_archive_path: Optional[str],
     metadata: Dict[str, Any],
     bake_gizmos: bool,
     repath_script_flag: bool = False,
+    save_script: bool = True,
+    include_movs: bool = False,
     timeout: int = 300 
 ) -> Dict[str, Any]:
     """Execute the _nuke_executor.py script via 'nuke -t'.
@@ -220,6 +228,8 @@ def execute_nuke_archive_process(
         metadata: Dictionary containing vendor, show, episode, shot, etc.
         bake_gizmos: Whether to bake gizmos in the script.
         repath_script_flag: Whether to enable repathing knobs within the script.
+        save_script: Whether to save the processed Nuke script into the archive.
+        include_movs: Whether to include publish-root .mov files that match publish/script version tokens.
         timeout: Timeout in seconds for the entire Nuke process.
 
     Returns:
@@ -249,15 +259,27 @@ def execute_nuke_archive_process(
         str(constants.NUKE_EXECUTOR_SCRIPT_PATH),
         "--input-script-path", fixenv.normalize_path(input_script_path),
         "--archive-root", fixenv.normalize_path(archive_root), # Pass for context
-        "--final-script-archive-path", fixenv.normalize_path(final_script_archive_path),
         "--metadata-json", metadata_json_string, # Pass for context
     ]
+    if final_script_archive_path:
+        command.extend(["--final-script-archive-path", fixenv.normalize_path(final_script_archive_path)])
     if bake_gizmos: command.append("--bake-gizmos")
     if repath_script_flag: command.append("--repath-script")
+    if save_script: command.append("--save-script")
+    if include_movs: command.append("--include-movs")
 
-    # Use environment as is - NUKE_PATH is set up in the fixarc launcher script
+    # Preserve launcher-provided environment so Nuke loads the correct site init/plugins/fonts.
     env = os.environ.copy()
-    env["NUKE_PATH"] = r"Z:\pipe\Nuke\main" # Add or override NUKE_PATH
+    current_nuke_path = env.get("NUKE_PATH", "").strip()
+    if current_nuke_path:
+        log.debug(f"Using existing NUKE_PATH for Nuke subprocess: {current_nuke_path}")
+    else:
+        # Conservative fallback for Linux environments when launcher did not set NUKE_PATH.
+        fallback_nuke_path = "/mnt/pipe/Nuke/linux"
+        if os.name == "nt" and sys.platform == "win32":
+            fallback_nuke_path = "Z:/pipe/Nuke/win"
+        env["NUKE_PATH"] = fallback_nuke_path
+        log.warning(f"NUKE_PATH was not set; using fallback: {fallback_nuke_path}")
     
     # Set NUKE_VERBOSITY environment variable based on current log level to propagate verbosity
     current_log_level = log.getEffectiveLevel()
@@ -518,12 +540,23 @@ def copy_files_robustly(
 
     # Sort items for somewhat predictable processing, helpful for logs
     sorted_items = sorted(list(dependencies_to_copy.items()), key=lambda item: item[0])
+    log.debug(f"Sorted dependency items for processing: {[item[0] for item in sorted_items]}")
+
+    # Some dependency maps include both a directory and sequence/file entries under it.
+    # If the parent directory is being copied, missing child pattern entries are expected.
+    existing_directory_sources = {
+        fixenv.normalize_path(src)
+        for src, data in sorted_items
+        if data.get("is_directory", False) and data.get("exists_on_disk", False)
+    }
 
     for index, (source_path, dep_data) in enumerate(sorted_items):
+        log.debug(f"Processing dependency item {index+1}/{total_expected_entries}: Source='{source_path}', Data={dep_data}")
         destination_path = dep_data.get("destination_path")
         is_directory = dep_data.get("is_directory", False)
         # Default to True for exists_on_disk if key somehow missing, though it should always be provided by Nuke executor
-        exists_on_disk = dep_data.get("exists_on_disk", True) 
+        exists_on_disk = dep_data.get("exists_on_disk", True)
+        dependency_category = str(dep_data.get("dependency_category", "")).lower()
 
         log.debug(
             f"Processing item {index+1}/{total_expected_entries}: "
@@ -537,6 +570,25 @@ def copy_files_robustly(
             continue
 
         if not exists_on_disk:
+            if not is_directory:
+                source_parent = str(Path(source_path).parent)
+                covered_by_directory = any(
+                    source_parent == dir_src or source_parent.startswith(f"{dir_src}/")
+                    for dir_src in existing_directory_sources
+                )
+                if covered_by_directory:
+                    log.debug(
+                        f"Skipping non-existent child entry already covered by parent directory copy: {source_path}"
+                    )
+                    continue
+
+                # Publish outputs can reference stale/non-existent versions in scripts.
+                # These are non-fatal for archive completeness of actual on-disk data.
+                if dependency_category == "publish":
+                    log.debug(
+                        f"Skipping missing publish-category entry (non-fatal): {source_path}"
+                    )
+                    continue
             log.warning(f"Skipping copy for non-existent source: {source_path} (Is Directory: {is_directory})")
             failure_count += 1
             continue
@@ -701,6 +753,217 @@ def copy_files_robustly(
     return success_count, failure_count
 
 
+def _non_empty(value: Any) -> bool:
+    """Return True when value is meaningfully set (not None/empty/whitespace)."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _candidate_ingest_settings_paths(explicit_path: Optional[str] = None) -> List[str]:
+    """Build ordered ingest settings path candidates from explicit path, env, and known defaults."""
+    candidates: List[str] = []
+
+    if explicit_path:
+        candidates.append(explicit_path)
+
+    env_candidates = [
+        os.environ.get("FIXFX_INGEST_SETTINGS_PATH"),
+        os.environ.get("INGEST_SETTINGS_PATH"),
+    ]
+    candidates.extend([p for p in env_candidates if p])
+
+    project_settings_path = getattr(fixenv.constants, "PROJECT_SETTINGS_PATH", None)
+    if project_settings_path:
+        candidates.append(str(Path(project_settings_path) / "ingest_settings.yaml"))
+
+    candidates.extend(DEFAULT_INGEST_SETTINGS_CANDIDATES)
+
+    deduped: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized = fixenv.normalize_path(candidate)
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(normalized)
+    return deduped
+
+
+def load_ingest_settings(config_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Load ingest settings YAML from explicit path or known studio locations."""
+    for path_str in _candidate_ingest_settings_paths(config_path):
+        path_obj = Path(path_str)
+        if not path_obj.is_file():
+            continue
+
+        try:
+            with open(path_obj, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+            if isinstance(data, dict):
+                log.debug(f"Loaded ingest settings from: {path_obj}")
+                return data
+            log.warning(f"Ingest settings at '{path_obj}' is not a YAML mapping. Ignoring.")
+        except Exception as e:
+            log.warning(f"Failed reading ingest settings '{path_obj}': {e}")
+
+    log.debug("No ingest settings YAML found in known locations.")
+    return None
+
+
+def _extract_project_from_path(path_str: str) -> Optional[str]:
+    """Extract project code from /proj/<project>/... style paths."""
+    parts = [p for p in path_str.split('/') if p]
+    for i, part in enumerate(parts):
+        if part.lower() == "proj" and i + 1 < len(parts):
+            return parts[i + 1].lower()
+    return None
+
+
+def _project_key_from_settings(path_str: str, settings: Dict[str, Any]) -> Optional[str]:
+    """Resolve project key from path or PROJECT_CODE_MAP fallback."""
+    direct_project = _extract_project_from_path(path_str)
+    if direct_project and direct_project in settings and isinstance(settings.get(direct_project), dict):
+        return direct_project
+
+    project_code_map = settings.get("PROJECT_CODE_MAP", {})
+    if not isinstance(project_code_map, dict):
+        return direct_project if direct_project in settings else None
+
+    if direct_project:
+        mapped = project_code_map.get(direct_project.upper())
+        if mapped and isinstance(settings.get(str(mapped).lower()), dict):
+            return str(mapped).lower()
+
+    return direct_project if direct_project in settings else None
+
+
+def _match_groups_from_patterns(path_str: str, project_settings: Dict[str, Any]) -> Dict[str, str]:
+    """Apply project regex patterns to path components and return first matched capture groups."""
+    shot_naming = project_settings.get("shot_naming", {})
+    if not isinstance(shot_naming, dict):
+        shot_naming = {}
+
+    regex_patterns = [
+        shot_naming.get("shot_code_pattern"),
+        shot_naming.get("shot_alias_pattern"),
+        shot_naming.get("pattern"),
+        project_settings.get("path_parts"),
+    ]
+    regex_patterns = [p for p in regex_patterns if isinstance(p, str) and p.strip()]
+
+    if not regex_patterns:
+        return {}
+
+    path_obj = Path(path_str)
+    candidates = [path_obj.stem]
+    candidates.extend(reversed([p for p in path_str.split('/') if p]))
+
+    for regex_str in regex_patterns:
+        try:
+            compiled = re.compile(regex_str, re.IGNORECASE)
+        except re.error as e:
+            log.warning(f"Invalid ingest regex '{regex_str}': {e}")
+            continue
+
+        for candidate in candidates:
+            match = compiled.match(candidate)
+            if match:
+                groups = {k: v for k, v in match.groupdict().items() if _non_empty(v)}
+                if groups:
+                    log.debug(f"Ingest regex matched candidate '{candidate}': {groups}")
+                return groups
+    return {}
+
+
+def _compose_episode(groups: Dict[str, str]) -> Optional[str]:
+    """Compose episode token when regex splits project and episode into separate groups."""
+    episode = groups.get("episode")
+    project = groups.get("project")
+    if not _non_empty(episode):
+        return None
+    if _non_empty(project):
+        ep = str(episode)
+        project_token = str(project)
+        if not ep.lower().startswith(f"{project_token.lower()}_"):
+            return f"{project_token}_{ep}"
+    return str(episode)
+
+
+def _normalize_shot_and_tag(episode: Optional[str], sequence: Optional[str], shot: Optional[str], tag: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Normalize shot/tag from either shot-only or full-shot identifiers."""
+    if not _non_empty(shot):
+        return None, tag
+
+    shot_value = str(shot).strip()
+    tag_value = str(tag).strip() if _non_empty(tag) else None
+
+    if _non_empty(episode) and _non_empty(sequence):
+        prefix = f"{episode}_{sequence}_"
+        if shot_value.lower().startswith(prefix.lower()):
+            remainder = shot_value[len(prefix):]
+            if '_' in remainder:
+                shot_part, maybe_tag = remainder.split('_', 1)
+                return shot_part, tag_value or maybe_tag
+            return remainder, tag_value
+
+    if '_' in shot_value and not tag_value:
+        shot_part, maybe_tag = shot_value.split('_', 1)
+        return shot_part, maybe_tag
+
+    return shot_value, tag_value
+
+
+def get_metadata_from_ingest_settings(script_path: str, config_path: Optional[str] = None) -> Dict[str, Any]:
+    """Infer metadata from ingest_settings.yaml using project-configured regex patterns."""
+    normalized_script_path = fixenv.normalize_path(script_path)
+    settings = load_ingest_settings(config_path=config_path)
+    if not settings:
+        return {}
+
+    project_key = _project_key_from_settings(normalized_script_path, settings)
+    if not project_key:
+        log.debug(f"Could not resolve project key from script path: {normalized_script_path}")
+        return {}
+
+    project_settings = settings.get(project_key)
+    if not isinstance(project_settings, dict):
+        return {"project": project_key, "show": project_key}
+
+    groups = _match_groups_from_patterns(normalized_script_path, project_settings)
+    episode = _compose_episode(groups)
+    sequence = groups.get("sequence") or groups.get("scene")
+    shot = groups.get("shot") or groups.get("shot_number")
+    tag = groups.get("tag")
+
+    shot, tag = _normalize_shot_and_tag(episode, sequence, shot, tag)
+
+    metadata: Dict[str, Any] = {
+        "project": project_key,
+        "show": project_key,
+        "episode": episode,
+        "sequence": sequence,
+        "shot": shot,
+        "tag": tag,
+    }
+
+    if _non_empty(episode) and _non_empty(sequence) and _non_empty(shot):
+        shot_name = f"{episode}_{sequence}_{shot}"
+        if _non_empty(tag):
+            shot_name = f"{shot_name}_{tag}"
+        metadata["shot_name"] = shot_name
+
+    compact_metadata = {k: v for k, v in metadata.items() if _non_empty(v)}
+    if compact_metadata:
+        log.info(f"Metadata inferred via ingest settings for '{script_path}': {compact_metadata}")
+    return compact_metadata
+
+
 # --- Metadata Extraction Wrapper ---
 def get_metadata_from_path(script_path: str) -> Dict[str, Any]:
     """
@@ -714,7 +977,7 @@ def get_metadata_from_path(script_path: str) -> Dict[str, Any]:
     """
     try:
         log.debug(f"Attempting to extract metadata from path: {script_path}")
-        studio_data = StudioData(script_path)
+        studio_data = StudioData(script_path, log=log)  # Pass the logger to StudioData for internal logging
         
         # DEBUG: Inspect the StudioData object attributes
         _debug_studio_data_object(studio_data)
@@ -724,6 +987,7 @@ def get_metadata_from_path(script_path: str) -> Dict[str, Any]:
         
         # Log the extracted metadata for debugging
         if metadata:
+            log.info(f"Extracted metadata from path '{script_path}': {metadata}")
             log.debug(f"Successfully extracted metadata: {metadata}")
         else:
             log.warning(f"No metadata could be extracted from path: {script_path}")

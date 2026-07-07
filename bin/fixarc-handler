@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Handles batch archiving of Nuke scripts using the 'fixarc' core tool.
 
@@ -45,7 +45,9 @@ try:
     # Attempt to use a pre-configured logger from a 'fixfx' package if available.
     # This allows centralized logging if fixarc-handler is part of a larger toolkit.
     from fixfx import log
+    print("Using logger from 'fixfx' package.")
 except ImportError:
+    print("Could not import 'log' from 'fixfx'. Using basic logging configuration.")
     # Fallback to a basic logging configuration if 'fixfx.log' is not available.
     # This ensures that logging is still functional when run standalone.
     logging.basicConfig(
@@ -85,6 +87,7 @@ def get_command_path(command_name, is_essential=True, relative_fallback_search_d
         if not isinstance(relative_fallback_search_dirs, list):
             relative_fallback_search_dirs = [relative_fallback_search_dirs]
         for fallback_dir in relative_fallback_search_dirs:
+            log.info(f"Searching for '{command_name}' in fallback directory: {fallback_dir}")
             # On Windows, command_name might not have .exe, .bat etc. shutil.which handles this.
             # For manual check, we might need to test for common extensions if just command_name is given.
             # However, if relative_fallback_search_dirs implies a direct file, os.path.isfile is fine.
@@ -93,6 +96,9 @@ def get_command_path(command_name, is_essential=True, relative_fallback_search_d
                 cmd_path = os.path.realpath(potential_path_direct)
                 log.info(f"Found '{command_name}' via relative path: {cmd_path}")
                 break
+            else:
+                log.info(f"'{command_name}' not found in {fallback_dir} as direct file.")
+                log.info(f"Checked path: {potential_path_direct} (exists: {os.path.isfile(potential_path_direct)}, executable: {os.access(potential_path_direct, os.X_OK)})")
             # Try with common windows executable extensions if on windows
             if sys.platform == "win32" and not os.path.splitext(command_name)[1]:
                  for ext in os.environ.get("PATHEXT", ".EXE;.BAT;.CMD;.COM").split(os.pathsep):
@@ -198,9 +204,13 @@ def build_search_paths(mode, project_name, names_to_process, base_path):
                 continue
             
             episode_dir = f"{parts[0]}_{parts[1]}" # e.g., BOB_101
-            sequence_dir = f"{parts[0]}_{parts[1]}_{parts[2]}" # e.g., BOB_101_010
+            if project_name == "wlb03":
+                sequence_dir = f"{parts[0]}_{parts[1]}_{parts[2]}_{parts[3]}" # e.g., BOB_101_010
+            else:
+                sequence_dir = f"{parts[0]}_{parts[1]}_{parts[2]}" # e.g., BOB_101_010
             # Structure: {base_path}/{project_name}/shots/{episode_dir}/{sequence_dir}/{shot_name}/
             search_root = os.path.join(base_path, project_name, "shots", episode_dir, sequence_dir, shot_name)
+            log.debug(f"Constructed search path for shot '{shot_name}': {search_root}")
             if not os.path.isdir(search_root):
                 log.warning(f"Shot directory not found: {search_root}. Will not search here.")
                 missing_search_roots.append(search_root)
@@ -416,7 +426,13 @@ def main():
 
     deadline_cmd_path = None
     if args.farm:
-        deadline_cmd_path = get_command_path("deadlinecommand", is_essential=True)
+        deadline_path = "/opt/Thinkbox/Deadline10/bin"  # Adjust this path as needed for your environment
+        if os.path.exists(deadline_path):
+            deadline_cmd_path = get_command_path("deadlinecommand", is_essential=True, relative_fallback_search_dirs=[deadline_path])
+        else:
+            log.error(f"Deadline path does not exist: {deadline_path}. Cannot submit jobs to farm.")
+            sys.exit(1)
+        #deadline_cmd_path = get_command_path("deadlinecommand", is_essential=True)
         log.info(f"Using 'deadlinecommand': {deadline_cmd_path}")
 
     # --- Determine Operating Mode and Target Names ---
@@ -566,10 +582,9 @@ def main():
             if not args.farm: # Local execution
                 log.info(f"Executing 'fixarc' locally for {script_basename}...") 
                 try:
-                    # Capture output to get stderr in case of failure
-                    process = subprocess.run(base_cmd_args, check=True, text=True, encoding='utf-8', capture_output=True)
+                    # Stream output live so the child process logs stay visible in the terminal.
+                    process = subprocess.run(base_cmd_args, check=True)
                     log.info(f"Successfully archived: {script_basename}")
-                    if process.stdout.strip(): log.debug(f"  fixarc stdout:\n{process.stdout.strip()}") # Log stdout if any
                     success_count += 1
                 except subprocess.CalledProcessError as e:
                     log.error(f"'fixarc' command FAILED for: {script_basename} (Exit code: {e.returncode})")
@@ -577,10 +592,8 @@ def main():
                     failed_script_details.append({
                         "name": script_basename,
                         "returncode": e.returncode,
-                        "stderr": e.stderr.strip() if e.stderr else "No stderr captured."
+                        "stderr": "Child process output was streamed directly to the terminal."
                     })
-                    if e.stdout.strip(): log.warning(f"  fixarc stdout on error:\n{e.stdout.strip()}") # Log stdout on error if any
-                    if e.stderr.strip(): log.warning(f"  fixarc stderr on error:\n{e.stderr.strip()}") # Log full stderr at warning for detail
                     fail_count += 1
                 except FileNotFoundError: 
                     log.error(f"Critical error: 'fixarc' command not found at {fixarc_cmd_path} during execution attempt. Halting for {script_basename}.")
@@ -596,21 +609,22 @@ def main():
                 
                 # Sanitize job name for Deadline and file system
                 job_name = f"FixArc_Handler: {project_name} - {script_basename}"
-                job_name_sanitized = "".join(c if c.isalnum() or c in ('_', '-', '.', ':') else '_' for c in job_name).strip()
+                job_name_sanitized = "".join(c if c.isalnum() or c in ('_', '-', '.') else '_' for c in job_name).strip()
                 if not job_name_sanitized: # Ensure a valid name
                     job_name_sanitized = f"fixarc_job_{script_basename.replace('.', '_')}" # Fallback if sanitization results in empty
                 
                 # Create filenames for Deadline job info files.
                 job_info_filename = f"{job_name_sanitized}.job"
-                # plugin_info_filename = f"{job_file_basename}.plugin" # Not used in this basic setup
+                plugin_info_filename = f"{job_name_sanitized}.plugin"
 
                 job_info_file_path = os.path.join(main_temp_dir_for_all_jobs, job_info_filename)
+                plugin_info_file_path = os.path.join(main_temp_dir_for_all_jobs, plugin_info_filename)
 
                 # Arguments for the Deadline CommandLine plugin are the arguments to `fixarc` (excluding `fixarc` itself).
                 # Ensure arguments are properly quoted for the command line.
                 deadline_job_args_str = ' '.join(f'"{arg}"' for arg in base_cmd_args[1:]) 
 
-                # Content for the Deadline .job file (Plugin=CommandLine)
+                # Content for Deadline job info (.job)
                 job_info_content = [
                     f"Plugin=CommandLine",
                     f"Name={job_name_sanitized}",
@@ -625,23 +639,46 @@ def main():
                     # f"Priority=50",
                     # f"OutputDirectory0=...", # If fixarc produces specific output files logged by Deadline
                     # f"OutputFilename0=...",
-                    f"Executable={shlex.quote(base_cmd_args[0])}", # Path to fixarc, quoted
-                    f"Arguments={deadline_job_args_str}" # Arguments for fixarc
                 ]
-                # Optional: StartInDirectory={shlex.quote(os.path.dirname(base_cmd_args[0]))}
+
+                # Content for Deadline plugin info (.plugin) for CommandLine plugin
+                plugin_info_content = [
+                    f"Executable={base_cmd_args[0]}",
+                    f"Arguments={deadline_job_args_str}",
+                    f"StartupDirectory={os.path.dirname(base_cmd_args[0])}",
+                ]
 
                 try:
-                    # Write the .job file
+                    # Write Deadline job and plugin files
                     with open(job_info_file_path, 'w', encoding='utf-8') as f:
                         f.write("\n".join(job_info_content) + "\n")
+                    with open(plugin_info_file_path, 'w', encoding='utf-8') as f:
+                        f.write("\n".join(plugin_info_content) + "\n")
                     log.debug(f"  Deadline Job Info file written to: {job_info_file_path}")
+                    log.debug(f"  Deadline Plugin Info file written to: {plugin_info_file_path}")
 
                     # Construct the deadlinecommand call
-                    deadline_submission_cmd = [deadline_cmd_path, job_info_file_path]
-                    # If a plugin info file were used: deadline_submission_cmd.append(plugin_info_file_path)
+                    deadline_submission_cmd = [deadline_cmd_path, job_info_file_path, plugin_info_file_path]
+
+                    # Deadline's commandline tool needs its bundled Python libraries on the loader path.
+                    deadline_env = os.environ.copy()
+                    deadline_lib_dir = "/opt/Thinkbox/Deadline10/lib/python3/lib"
+                    existing_ld_library_path = deadline_env.get("LD_LIBRARY_PATH", "")
+                    ld_library_parts = [deadline_lib_dir]
+                    if existing_ld_library_path:
+                        ld_library_parts.append(existing_ld_library_path)
+                    deadline_env["LD_LIBRARY_PATH"] = ":".join(part for part in ld_library_parts if part)
 
                     log.info(f"  Submitting Deadline job: {' '.join(deadline_submission_cmd)}")
-                    process = subprocess.run(deadline_submission_cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+                    log.debug(f"  LD_LIBRARY_PATH for Deadline submission: {deadline_env['LD_LIBRARY_PATH']}")
+                    process = subprocess.run(
+                        deadline_submission_cmd,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        encoding='utf-8',
+                        env=deadline_env,
+                    )
                     log.info(f"  Successfully submitted job for {script_basename} to Deadline.")
                     if process.stdout: log.debug(f"  Deadlinecommand stdout:\n{process.stdout.strip()}")
                     if process.stderr: log.debug(f"  Deadlinecommand stderr:\n{process.stderr.strip()}")

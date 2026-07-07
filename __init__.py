@@ -8,8 +8,8 @@ import sys
 import os
 
 # --- Centralized Logging Setup ---
-# Use the fixfx logger as a required dependency
-from fixfx.core.logger import get_logger
+# Use the fixenv logger as a required dependency
+from fixenv.logger import get_logger
 
 # Initialize the package root logger
 log = get_logger(__name__)  # Logger named 'fixarc'

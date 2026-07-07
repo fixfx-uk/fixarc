@@ -25,7 +25,10 @@ from . import log, __version__
 from . import constants  # Import constants module to access DEFAULT_VENDOR_NAME
 from .archive_utils import get_archive_script_path # Specific utility for script path
 from .utils import (
-    get_metadata_from_path, execute_nuke_archive_process, copy_files_robustly
+    get_metadata_from_path,
+    get_metadata_from_ingest_settings,
+    execute_nuke_archive_process,
+    copy_files_robustly,
 )
 from .exceptions import (
     ConfigurationError, DependencyError, NukeExecutionError, ParsingError, RepathingError, GizmoError, PruningError, ArchiverError
@@ -74,6 +77,18 @@ def create_parser() -> argparse.ArgumentParser:
         "--shot", type=str,
         help="Shot identifier (e.g., 'BOB_100_000_050_MTS'). Will attempt to infer if not provided."
     )
+    metadata_group.add_argument(
+        "--tag", type=str,
+        help="Optional shot tag (e.g., 'CLN'). Inferred from ingest settings when available."
+    )
+
+    metadata_group.add_argument(
+        "--nukescript",
+        type=str,
+        choices=("yes", "no"),
+        default="yes",
+        help="Whether to save the processed Nuke script into the archive folder. Use 'no' to archive dependencies only."
+    )
 
     # --- Options Group ---
     options_group = parser.add_argument_group('Processing Options')
@@ -103,6 +118,11 @@ def create_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Simulate Nuke processing and file mapping. Skips saving the final script and copying files."
+    )
+    options_group.add_argument(
+        "--include-movs",
+        action="store_true",
+        help="Include publish-root .mov QuickTimes in the archive when their version matches the script/publish version."
     )
 
     # --- General Arguments ---
@@ -166,8 +186,14 @@ def _setup_logging(verbosity: int) -> None:
 
 def _prepare_and_validate_metadata(args: argparse.Namespace, script_path: str) -> Dict[str, Any]:
     """Infers, merges, and validates required metadata."""
-    log.debug("Preparing and validating metadata...")
-    inferred = get_metadata_from_path(script_path) # Uses fixenv if available
+    log.info("Preparing and validating metadata...")
+
+    inferred_from_ingest = get_metadata_from_ingest_settings(script_path)
+    inferred_from_studiodata = get_metadata_from_path(script_path) # Fallback for legacy paths
+
+    # Prefer ingest-settings inference, then StudioData values for missing fields.
+    inferred: Dict[str, Any] = dict(inferred_from_studiodata)
+    inferred.update({k: v for k, v in inferred_from_ingest.items() if v is not None and str(v).strip() != ""})
     
     # Log what was inferred from the path
     if inferred:
@@ -175,8 +201,8 @@ def _prepare_and_validate_metadata(args: argparse.Namespace, script_path: str) -
     else:
         log.warning("No metadata could be inferred from the script path.")
 
-    # Try to get a complete shot identifier directly from inferred data first
-    inferred_shot = inferred.get("shot_name") or inferred.get("shot")
+    # Try to get a complete shot identifier directly from inferred data first.
+    inferred_shot = inferred.get("shot") or inferred.get("shot_name")
     
     # If shot wasn't directly available, check if we have the components to build it
     if not inferred_shot and all(k in inferred for k in ("episode", "sequence", "shot_number")):
@@ -189,16 +215,30 @@ def _prepare_and_validate_metadata(args: argparse.Namespace, script_path: str) -
             if sh_tag: inferred_shot += f"_{sh_tag}"
             log.info(f"Constructed shot name from inferred parts: {inferred_shot}")
 
-    # Build metadata including sequence and tag for full context in Nuke executor
+    # Build metadata including sequence and optional tag for full context in Nuke executor.
     metadata = {
         "vendor": args.vendor or constants.DEFAULT_VENDOR_NAME,
         "show": args.show or inferred.get("project") or inferred.get("show"),  # Map inferred 'project' to 'show'
         "episode": args.episode or inferred.get("episode"),
-        # Include sequence and tag from inferred StudioData for dependency mapping
+        # Include sequence and tag for dependency mapping and archive layout.
         "sequence": inferred.get("sequence"),
-        "tag": inferred.get("tag"),
+        "tag": args.tag if args.tag is not None else (inferred.get("tag") or ""),
         "shot": args.shot or inferred_shot,
     }
+
+    # Normalize shot when a full shot code was supplied (EP_SEQ_SHOT[_TAG]).
+    if metadata.get("shot") and metadata.get("episode") and metadata.get("sequence"):
+        shot_prefix = f"{metadata['episode']}_{metadata['sequence']}_"
+        shot_value = str(metadata["shot"])
+        if shot_value.lower().startswith(shot_prefix.lower()):
+            remainder = shot_value[len(shot_prefix):]
+            if '_' in remainder:
+                shot_only, inferred_tag = remainder.split('_', 1)
+                metadata["shot"] = shot_only
+                if not metadata.get("tag"):
+                    metadata["tag"] = inferred_tag
+            else:
+                metadata["shot"] = remainder
     
     # Log what we got from CLI vs inference
     for key, value in metadata.items():
@@ -209,7 +249,7 @@ def _prepare_and_validate_metadata(args: argparse.Namespace, script_path: str) -
             log.debug(f"Using inferred value for '{key}': {value}")
 
     # Validate required fields for SPT structure
-    required_keys = ["vendor", "show", "episode", "shot"]  # sequence and tag are optional for CLI
+    required_keys = ["vendor", "show", "episode", "sequence", "shot"]  # tag remains optional
     missing = [k for k in required_keys if not metadata.get(k)]
     
     if missing:
@@ -220,8 +260,8 @@ def _prepare_and_validate_metadata(args: argparse.Namespace, script_path: str) -
         error_msg = f"Missing required metadata for archive structure. Please provide via CLI ({', '.join(missing_args)})."
         
         # Add path inference suggestion
-        error_msg += "\n\nAlternatively, ensure your script path follows the studio pattern for automatic inference."
-        error_msg += "\nExample path: /proj/bob01/shots/BOB_100/BOB_100_010_CMP/publish/nuke/my_script.nk"
+        error_msg += "\n\nAlternatively, ensure your script path can be parsed by ingest_settings.yaml for automatic inference."
+        error_msg += "\nExample path: /proj/bob02/shots/BOB_201/BOB_201_000/BOB_201_000_000_CLN/publish/nuke/my_script.nk"
         
         # Add what we found (or didn't find)
         error_msg += f"\n\nRequired: {required_keys}"
@@ -247,6 +287,9 @@ def main(args: Optional[List[str]] = None) -> None:
     _setup_logging(parsed_args.verbose)
     log.info(f"--- Starting Fix Archive Tool v{__version__} ---")
     if parsed_args.dry_run: log.warning("--- DRY RUN MODE ENABLED ---")
+    save_nuke_script = str(parsed_args.nukescript).lower() != "no"
+    if not save_nuke_script:
+        log.warning("Nuke script save step disabled via --nukescript no; dependencies will still be collected and copied.")
     
     # Log the vendor source
     if parsed_args.vendor == constants.DEFAULT_VENDOR_NAME:
@@ -263,6 +306,7 @@ def main(args: Optional[List[str]] = None) -> None:
     try:
         # --- Input Validation and Metadata Preparation ---
         original_script_path = normalize_path(parsed_args.script_path)
+        log.debug(f"Normalized input script path: {original_script_path}")
         archive_root = normalize_path(parsed_args.archive_root)
         if not Path(original_script_path).is_file():
              raise ConfigurationError(f"Input script not found or is not a file: {original_script_path}")
@@ -287,11 +331,15 @@ def main(args: Optional[List[str]] = None) -> None:
             else:
                 raise
 
-        # Determine the final path for the Nuke script *before* calling Nuke process
-        final_script_archive_path = get_archive_script_path(
-            archive_root, metadata, Path(original_script_path).name
-        )
-        log.info(f"Calculated final archive path for script: {final_script_archive_path}")
+        # Determine the final path for the Nuke script only when it is needed.
+        final_script_archive_path: Optional[str] = None
+        if save_nuke_script or parsed_args.update_script:
+            final_script_archive_path = get_archive_script_path(
+                archive_root, metadata, Path(original_script_path).name
+            )
+            log.info(f"Calculated final archive path for script: {final_script_archive_path}")
+        else:
+            log.info("Skipping archive script path calculation because --nukescript no and --update-script was not requested.")
 
         # --- Execute Core Nuke Process ---
         log.info("--- Step 1: Executing Nuke Process (Load, Prune, Bake, Repath, Save) ---")
@@ -315,6 +363,8 @@ def main(args: Optional[List[str]] = None) -> None:
                 metadata=metadata,
                 bake_gizmos=parsed_args.bake_gizmos,
                 repath_script_flag=parsed_args.update_script,
+                save_script=save_nuke_script,
+                include_movs=parsed_args.include_movs,
                 # timeout=300 # Optional: Adjust timeout if needed
             )
             # execute_nuke_archive_process raises NukeExecutionError on failure

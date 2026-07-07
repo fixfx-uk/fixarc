@@ -103,6 +103,47 @@ def is_sequence_pattern(path: Union[str, Path]) -> bool:
     """
     return get_frame_padding_pattern(path) is not None
 
+
+WINDOWS_ABS_PATH_RE = re.compile(r"^[A-Za-z]:/")
+
+
+def _translate_path_for_linux_checks(path_str: str) -> str:
+    """Translate Nuke/Windows-style paths to Linux mount paths for existence checks."""
+    p = str(path_str).replace("\\", "/")
+    low = p.lower()
+
+    # Common Nuke-resolved pseudo-absolute roots on Linux hosts.
+    if low.startswith("/proj/"):
+        return f"/mnt{p}"
+    if low.startswith("/fxlb/"):
+        return f"/mnt{p}"
+    if low.startswith("/pipe/"):
+        return f"/mnt{p}"
+
+    # Common Windows roots used in scripts.
+    if low.startswith("z:/proj/"):
+        return f"/mnt/proj/{p[8:]}"
+    if low.startswith("z:/fxlb/"):
+        return f"/mnt/fxlb/{p[8:]}"
+    if low.startswith("z:/pipe/"):
+        return f"/mnt/pipe/{p[8:]}"
+
+    return p
+
+
+def _resolve_path_for_disk_checks(path_in_nuke: str, script_dir: Optional[str]) -> str:
+    """Resolve a knob path to an on-disk path for stat/copy checks on Linux."""
+    translated = _translate_path_for_linux_checks(path_in_nuke)
+
+    # Keep explicit Windows absolute paths from being joined to script_dir.
+    if WINDOWS_ABS_PATH_RE.match(translated):
+        return translated.replace("\\", "/")
+
+    if script_dir and not os.path.isabs(translated):
+        translated = os.path.abspath(os.path.join(script_dir, translated))
+
+    return str(translated).replace("\\", "/")
+
 def log_nuke_path_on_load():
     """Logs the NUKE_PATH environment variable as seen by Nuke."""
     nuke_path = os.environ.get('NUKE_PATH', 'Not Set')
@@ -423,13 +464,11 @@ def _collect_dependency_paths(
                 resolved_path_in_nuke_str = str(resolved_path_in_nuke_str).replace("\\", "/") # Corrected: single backslash
                 data_dict["resolved_path_in_nuke"] = resolved_path_in_nuke_str
                 
-                path_for_checks_str = resolved_path_in_nuke_str
-                if script_dir and not os.path.isabs(path_for_checks_str):
-                    path_for_checks_str = os.path.abspath(os.path.join(script_dir, path_for_checks_str))
-                    path_for_checks_str = str(path_for_checks_str).replace("\\", "/") # Corrected: single backslash
-                    _log_print("debug", f"    Absolutized '{resolved_path_in_nuke_str}' to '{path_for_checks_str}' for checks.")
-                elif not os.path.isabs(path_for_checks_str):
-                     _log_print("warning", f"    Path '{path_for_checks_str}' is relative but script_dir unavailable. Checks might be inaccurate.")
+                path_for_checks_str = _resolve_path_for_disk_checks(resolved_path_in_nuke_str, script_dir)
+                if path_for_checks_str != resolved_path_in_nuke_str:
+                    _log_print("debug", f"    Normalized '{resolved_path_in_nuke_str}' to '{path_for_checks_str}' for checks.")
+                elif not os.path.isabs(path_for_checks_str) and not WINDOWS_ABS_PATH_RE.match(path_for_checks_str):
+                    _log_print("warning", f"    Path '{path_for_checks_str}' is relative but script_dir unavailable. Checks might be inaccurate.")
 
                 path_for_checks_obj = Path(path_for_checks_str)
                 is_potential_sequence = is_sequence_pattern(data_dict["original_script_value"]) or \
@@ -950,7 +989,13 @@ def process_gizmo_baking(nodes: Set[nuke.Node], should_bake: bool) -> Tuple[int,
     
     return baked_count, nodes
 
-def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_root: str, metadata_dict: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+def generate_dependency_map(
+    dependency_info: Dict[str, Dict[str, Any]],
+    archive_root: str,
+    metadata_dict: Dict[str, Any],
+    input_script_path: Optional[str] = None,
+    include_movs: bool = False,
+) -> Dict[str, Dict[str, Any]]:
     """
     Generates the final dependency map for copying files.
     Uses 'source_item_on_disk' from dependency_info as the key to avoid redundancy
@@ -1071,13 +1116,24 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
             dependencies_to_copy[normalized_source_path_for_copy] = {
                 "destination_path": dest_path_str,
                 "is_directory": is_directory_to_copy,
-                "exists_on_disk": exists_on_disk
+                "exists_on_disk": exists_on_disk,
+                "dependency_category": dependency_category,
             }
             _log_print("debug", f"  Mapped dependency (Cat: {dependency_category}): \'{normalized_source_path_for_copy}\' -> Dest: \'{dest_path_str}\', IsDir: {is_directory_to_copy}, Exists: {exists_on_disk}")
 
         except Exception as map_e:
             _log_print("error", f"Could not calculate destination for copying \'{normalized_source_path_for_copy}\': {map_e} (from item key: {node_knob_identifier})")
             _log_print("debug", f"Exception details: {traceback.format_exc()}")
+
+    if include_movs:
+        _add_publish_mov_dependencies(
+            dependencies_to_copy=dependencies_to_copy,
+            dependency_info=dependency_info,
+            archive_root=archive_root,
+            metadata_dict=temp_metadata,
+            shot_code=shot_code,
+            input_script_path=input_script_path,
+        )
 
     _log_print("info", f"Collected mapping for {len(dependencies_to_copy)} unique file system items.")
     if dependencies_to_copy:
@@ -1090,6 +1146,126 @@ def generate_dependency_map(dependency_info: Dict[str, Dict[str, Any]], archive_
 
     return dependencies_to_copy
 
+
+def _extract_version_tokens(*values: Optional[str]) -> Set[str]:
+    """Extract normalized version tokens like 'v005' from one or more strings."""
+    tokens: Set[str] = set()
+    version_re = re.compile(r"[._-](v\d{3,4})(?=[._/-]|$)", re.IGNORECASE)
+    for value in values:
+        if not value:
+            continue
+        for match in version_re.findall(str(value)):
+            tokens.add(match.lower())
+    return tokens
+
+
+def _find_publish_root_from_script_path(input_script_path: str) -> Optional[Path]:
+    """Resolve the shot publish directory from an input script path."""
+    try:
+        script_path = Path(str(input_script_path).replace("\\", "/"))
+        if script_path.parent.name.lower() == "nuke" and script_path.parent.parent.name.lower() == "publish":
+            return script_path.parent.parent
+
+        for parent in script_path.parents:
+            if parent.name.lower() == "publish":
+                return parent
+    except Exception:
+        pass
+    return None
+
+
+def _add_publish_mov_dependencies(
+    dependencies_to_copy: Dict[str, Dict[str, Any]],
+    dependency_info: Dict[str, Dict[str, Any]],
+    archive_root: str,
+    metadata_dict: Dict[str, Any],
+    shot_code: str,
+    input_script_path: Optional[str],
+) -> None:
+    """
+    Add publish-root MOV files matching versions already selected for publish dependency copy.
+    This keeps MOV versions aligned with copied publish outputs (for example, EXR versions).
+    """
+    if not input_script_path:
+        return
+
+    publish_root = _find_publish_root_from_script_path(input_script_path)
+    if not publish_root or not publish_root.is_dir():
+        _log_print("debug", f"Publish root could not be resolved from script path: {input_script_path}")
+        return
+
+    version_tokens: Set[str] = set()
+    for source_path, dep_data in dependencies_to_copy.items():
+        if str(dep_data.get("dependency_category", "")).lower() != PUBLISH_REL:
+            continue
+        if not dep_data.get("exists_on_disk", False):
+            continue
+
+        source_str = str(source_path).replace("\\", "/")
+        # Avoid deriving tokens from MOVs themselves; anchor to publish outputs like EXRs.
+        if source_str.lower().endswith(".mov"):
+            continue
+
+        version_tokens.update(
+            _extract_version_tokens(
+                source_str,
+                dep_data.get("destination_path"),
+            )
+        )
+
+    if not version_tokens:
+        _log_print("debug", "No publish-output version token found in copy map; skipping MOV auto-collection.")
+        return
+
+    category_spt_path = _get_spt_path(str(archive_root), metadata_dict, PUBLISH_REL)
+    added_count = 0
+
+    try:
+        mov_files = sorted([p for p in publish_root.iterdir() if p.is_file() and p.suffix.lower() == ".mov"])
+    except Exception as e:
+        _log_print("warning", f"Unable to list publish root for MOV discovery '{publish_root}': {e}")
+        return
+
+    for mov_path in mov_files:
+        mov_version_tokens = _extract_version_tokens(mov_path.name)
+        if not mov_version_tokens:
+            continue
+        if not (mov_version_tokens & version_tokens):
+            continue
+
+        normalized_source = str(mov_path).replace("\\", "/")
+        if normalized_source in dependencies_to_copy:
+            continue
+
+        path_parts = normalized_source.split('/')
+        try:
+            shot_idx = next((i for i, part in enumerate(path_parts) if part == shot_code), -1)
+            if shot_idx != -1:
+                final_relative_part = "/".join(path_parts[shot_idx + 1:])
+            else:
+                final_relative_part = mov_path.name
+        except Exception:
+            final_relative_part = mov_path.name
+
+        publish_prefix = "publish/"
+        rel_lower = final_relative_part.lower().lstrip('/')
+        if rel_lower.startswith(publish_prefix):
+            idx = final_relative_part.lower().find(publish_prefix)
+            if idx != -1:
+                final_relative_part = final_relative_part[idx + len(publish_prefix):]
+
+        dest_path = category_spt_path / final_relative_part.lstrip('/')
+        dependencies_to_copy[normalized_source] = {
+            "destination_path": str(dest_path).replace("\\", "/"),
+            "is_directory": False,
+            "exists_on_disk": True,
+            "dependency_category": PUBLISH_REL,
+        }
+        added_count += 1
+
+    if added_count:
+        _log_print("info", f"Added {added_count} publish MOV dependency item(s) matching versions: {sorted(version_tokens)}")
+
 def _get_spt_path(
     archive_root_str: str,
     metadata_dict: Dict[str, Any],
@@ -1098,7 +1274,8 @@ def _get_spt_path(
     """
     Constructs SPT path within _nuke_executor.py, mirroring archive_utils.py logic.
     Structure: {archive_root}/{vendor}/{show}/{episode}/{SHOT_DIR_fmt}/{relative_category_path}
-    Assumes metadata_dict contains 'vendor', 'show', 'episode', 'sequence', 'shot', 'tag'.
+    Assumes metadata_dict contains 'vendor', 'show', 'episode', 'sequence', 'shot'.
+    'tag' is optional.
     Does not perform deep sanitization like ensure_ltfs_safe as that's external.
     If relative_category_path_str is ASSETS_REL, path is {archive_root}/{vendor}/assets.
     """
@@ -1120,13 +1297,16 @@ def _get_spt_path(
         episode = str(metadata_dict['episode'])
         sequence = str(metadata_dict['sequence'])
         shot_num = str(metadata_dict['shot'])
-        tag = str(metadata_dict['tag'])
+        raw_tag = metadata_dict.get('tag')
+        tag = str(raw_tag).strip() if raw_tag is not None else ""
 
         # --- Format directory components using locally defined constants ---
         show_fmt = SHOW_DIR.format(show=show)
         episode_fmt = EPISODE_DIR.format(episode=episode)
-        # Use the SHOT_DIR constant for the shot-level directory name
-        shot_dir_fmt = SHOT_DIR.format(episode=episode, sequence=sequence, shot=shot_num, tag=tag)
+        # Keep tag optional to avoid trailing underscores when tag is missing.
+        shot_dir_fmt = f"{episode}_{sequence}_{shot_num}"
+        if tag:
+            shot_dir_fmt = f"{shot_dir_fmt}_{tag}"
 
         # --- Construct Path ---
         # Path: archive_root / vendor / show / episode / formatted_shot_dir / category
@@ -1255,7 +1435,9 @@ def run_nuke_tasks(args: argparse.Namespace) -> Dict[str, Any]:
             map_for_copy_and_repath = generate_dependency_map(
                 dependency_info, # Output from _collect_dependency_paths
                 args.archive_root,
-                metadata_dict
+                metadata_dict,
+                args.input_script_path,
+                args.include_movs,
             )
             results["dependencies_to_copy"] = map_for_copy_and_repath # This is the map for the main process
             _log_print("info", f"Step 8: Generate Full Dependency Map COMPLETED. Found {len(map_for_copy_and_repath)} items for potential copy/repath.")
@@ -1267,7 +1449,9 @@ def run_nuke_tasks(args: argparse.Namespace) -> Dict[str, Any]:
         # 9. Repath Knobs (Optional) - Operates on required_nodes (potentially after baking)
         _log_print("info", "Step 9: Repathing Script Knobs (Optional)... ")
         repath_count = 0
-        if args.repath_script:
+        if args.repath_script and not args.save_script:
+            _log_print("warning", "Repathing was requested, but --save-script is disabled. Skipping repath because there is no archived script destination to repath against.")
+        elif args.repath_script:
             if not args.final_script_archive_path:
                 # This should have been caught by arg parser, but double check
                 _log_print("error", "Final script archive path is required for repathing but not provided.")
@@ -1294,10 +1478,19 @@ def run_nuke_tasks(args: argparse.Namespace) -> Dict[str, Any]:
         # 10. Select Required Nodes and Save Final Script
         _log_print("info", "Step 10: Saving Pruned Script...")
         final_saved_script_path = ""
-        if results["status"] == "success": # Only save if no critical errors before this point
-            final_saved_script_path = save_pruned_script(required_nodes, args.final_script_archive_path, args.archive_root)
-            results["final_saved_script_path"] = final_saved_script_path
-            _log_print("info", "Step 10: Save Pruned Script COMPLETED.")
+        if not args.save_script:
+            _log_print("info", "Skipping final script save because --save-script was not enabled.")
+            results["final_saved_script_path"] = ""
+        elif results["status"] == "success": # Only save if no critical errors before this point
+            if not args.final_script_archive_path:
+                _log_print("error", "Final script archive path is required for saving but not provided.")
+                results["status"] = "failure"
+                errors.append("Save error: final_script_archive_path missing.")
+                results["final_saved_script_path"] = ""
+            else:
+                final_saved_script_path = save_pruned_script(required_nodes, args.final_script_archive_path, args.archive_root)
+                results["final_saved_script_path"] = final_saved_script_path
+                _log_print("info", "Step 10: Save Pruned Script COMPLETED.")
         else:
             _log_print("error", "Skipping final script save due to earlier errors or status not being 'success'.")
             # Ensure final_saved_script_path is in results for consistent structure, even if empty
@@ -1351,10 +1544,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Internal Nuke Executor for Fix Archive")
     parser.add_argument("--input-script-path", required=True, help="Source .nk script")
     parser.add_argument("--archive-root", required=True, help="Archive destination root")
-    parser.add_argument("--final-script-archive-path", required=True, help="Absolute path where final script should be saved")
+    parser.add_argument("--final-script-archive-path", help="Absolute path where final script should be saved")
     parser.add_argument("--metadata-json", required=True, help="JSON string of metadata (vendor, show, etc.)")
     parser.add_argument("--bake-gizmos", action="store_true", help="Flag to enable gizmo baking")
     parser.add_argument("--repath-script", action="store_true", help="Flag to enable repathing")
+    parser.add_argument("--save-script", action="store_true", help="Flag to enable saving the pruned Nuke script")
+    parser.add_argument("--include-movs", action="store_true", help="Flag to include publish-root .mov files matching publish/script versions")
 
     exit_code = 1 # Default to error
     final_results: Dict[str, Any] = {"status": "failure", "errors": []} # Initialize
