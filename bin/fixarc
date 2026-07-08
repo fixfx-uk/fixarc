@@ -12,6 +12,16 @@ import runpy
 import platform
 import subprocess
 
+global FIXDRIVE
+
+if os.name == 'nt':
+    FIXDRIVE = 'Z:/'
+elif os.name == 'posix':
+    FIXDRIVE = '/mnt/'
+else:
+    FIXDRIVE = '/mnt/'  # Default for unknown OS
+
+
 def main():
     """Modify sys.path and use runpy to run the fixarc CLI module."""
     target_module = "fixarc.cli" # Use fully qualified module name with package prefix - needed as cli uses relative package imports
@@ -36,10 +46,11 @@ def main():
             
         # Try to get fixenv path
         fixenv_root = os.path.abspath(os.path.join(project_root, '..', 'fixenv'))
-        fixenv_root = "/mnt/pipe/Fixenv/git"
+        fixenv_root = f"{FIXDRIVE}pipe/Fixenv/git"
         if os.path.exists(fixenv_root) and fixenv_root not in sys.path:
             sys.path.insert(0, fixenv_root)
             print(f"Added fixenv root to sys.path: {fixenv_root}")
+        
             
         # --- Attempt to import fixenv early ---
         # This makes 'fixenv' a local variable for the main() function's scope.
@@ -51,7 +62,7 @@ def main():
             raise ImportError(f"Failed to import fixenv: {e}")
             
         # Import fixfx.log for logging
-        fixfx_root = "/mnt/pipe/Fixfx/main"
+        fixfx_root = f"{FIXDRIVE}pipe/Fixfx/main"
         if os.path.exists(fixfx_root) and fixfx_root not in sys.path:
             sys.path.insert(0, fixfx_root)
             print(f"Added fixfx root to sys.path: {fixfx_root}")
@@ -136,6 +147,8 @@ def main():
 
         # Log the current NUKE_PATH for debugging
         nuke_path = os.environ.get('NUKE_PATH', 'Not Set')
+        if os.name == 'nt':
+            nuke_path = r"Z:\pipe\Nuke\releases\v2.0.7\nuke"
         log.info(f"Current NUKE_PATH: {nuke_path}")
         print(f"Current NUKE_PATH: {nuke_path}")
         
@@ -157,7 +170,10 @@ def main():
             except Exception as e:
                 log.error(f"Manual NUKE_PATH setup failed: {e}")
 
+        if os.name == 'nt':
+            os.environ['NUKE_PATH'] = r"Z:\pipe\Nuke\releases\v2.0.7\nuke"
         print(f"Final NUKE_PATH: {os.environ.get('NUKE_PATH', 'Not Set')}")
+        
         log.info(f"Attempting to run module '{target_module}'")
         log.debug(f"sys.path: {sys.path}")
 

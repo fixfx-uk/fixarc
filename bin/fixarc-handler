@@ -82,6 +82,10 @@ def get_command_path(command_name, is_essential=True, relative_fallback_search_d
         SystemExit: If `is_essential` is True and the command cannot be found.
     """
     cmd_path = shutil.which(command_name)
+    if cmd_path and cmd_path.startswith(r"Z"):
+        log.warning(f"Command '{command_name}' found on network path: {cmd_path}")
+        cmd_path = r"C:\Users\calvin.c\Documents\code\fixarc\bin\fixarc.bat" # Hardcoded fallback for known network path issue
+    log.debug(f"Searching for command '{command_name}' in system PATH. Found: {cmd_path}")
 
     if not cmd_path and relative_fallback_search_dirs:
         if not isinstance(relative_fallback_search_dirs, list):
@@ -421,6 +425,7 @@ def main():
 
     # --- Locate Essential Commands ---
     current_script_dir = os.path.dirname(os.path.realpath(__file__))
+    log.info(f"Current script directory: {current_script_dir}")
     fixarc_cmd_path = get_command_path("fixarc", is_essential=True, relative_fallback_search_dirs=[current_script_dir])
     log.info(f"Using 'fixarc' command: {fixarc_cmd_path}")
 

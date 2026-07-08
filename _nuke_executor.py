@@ -120,13 +120,14 @@ def _translate_path_for_linux_checks(path_str: str) -> str:
     if low.startswith("/pipe/"):
         return f"/mnt{p}"
 
-    # Common Windows roots used in scripts.
-    if low.startswith("z:/proj/"):
-        return f"/mnt/proj/{p[8:]}"
-    if low.startswith("z:/fxlb/"):
-        return f"/mnt/fxlb/{p[8:]}"
-    if low.startswith("z:/pipe/"):
-        return f"/mnt/pipe/{p[8:]}"
+    if os.name != 'nt':
+        # Common Windows roots used in scripts.
+        if low.startswith("z:/proj/"):
+            return f"/mnt/proj/{p[8:]}"
+        if low.startswith("z:/fxlb/"):
+            return f"/mnt/fxlb/{p[8:]}"
+        if low.startswith("z:/pipe/"):
+            return f"/mnt/pipe/{p[8:]}"
 
     return p
 
