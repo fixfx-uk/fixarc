@@ -29,6 +29,7 @@ Example Usages:
 """
 
 import argparse
+import re
 import sys
 import os
 import subprocess # For potential calls to fixarc or deadlinecommand
@@ -270,10 +271,25 @@ def find_and_filter_nuke_scripts(search_paths, max_versions):
                 log.debug(f"Checking Nuke publish directory: {nuke_publish_dir}")
                 
                 # List all .nk files in this directory.
-                # sorted() here provides lexicographical sorting.
+                # sorted() here provides lexicographical sorting
+
+                def version_key(path):
+                    filename = os.path.basename(path)
+                    match = re.search(r"_v(\d+)\.nk$", filename, re.IGNORECASE)
+                    return int(match.group(1)) if match else -1
+                
                 nk_files_in_dir = sorted(
-                    [os.path.join(nuke_publish_dir, f) for f in os.listdir(nuke_publish_dir) if f.endswith(".nk") and os.path.isfile(os.path.join(nuke_publish_dir, f))]
+                    [
+                        os.path.join(nuke_publish_dir, f)
+                        for f in os.listdir(nuke_publish_dir)
+                        if f.endswith(".nk") and os.path.isfile(os.path.join(nuke_publish_dir, f)) and "Roto" not in f and "roto" not in f
+                    ],
+                    key=version_key
                 )
+
+                #nk_files_in_dir = sorted(
+                #    [os.path.join(nuke_publish_dir, f) for f in os.listdir(nuke_publish_dir) if f.endswith(".nk") and os.path.isfile(os.path.join(nuke_publish_dir, f))]
+                #)
                 
                 if not nk_files_in_dir:
                     log.debug(f"  No .nk files found in {nuke_publish_dir}")
