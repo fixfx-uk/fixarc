@@ -29,6 +29,7 @@ def get_shot_list(project, episode):
                              ["code", "description"])
     
     shot_list = []
+    skip_list = []
     for shot in shots:
         #print(f"Found shot: {shot['code']} - {shot.get('description', 'No description')}")
         description = shot.get('description', 'No description')
@@ -53,12 +54,13 @@ def get_shot_list(project, episode):
                 continue
             else:
                 print(f"Skipping shot {shot['code']} with description '{description}' due to 'wig' in description without 'and', 'additional', or newline.")
+                skip_list.append((shot['code'], description))
                 continue  # Skip this shot
 
         
     
 
-    return shot_list
+    return shot_list, skip_list
 
 
 if __name__ == "__main__":
@@ -68,7 +70,7 @@ if __name__ == "__main__":
     episode = args[1]
     
 
-    data = get_shot_list(project, episode)
+    data, skip = get_shot_list(project, episode)
 
     print(f"Shot list for project '{project}' and episode '{episode}':")
     count = 0
@@ -80,4 +82,9 @@ if __name__ == "__main__":
         #if count >= 5:
         #    break  # Limit to first 5 shots for testing purposes
 
-    print(shot_str.strip())  # Print the shot codes as a single string
+    print(f"\n Total shots retrieved: {count}")
+    print(f"\n Total shots skipped due to 'wig' in description without 'and', 'additional', or newline: {len(skip)}")
+    for shot_code, description in skip:
+        print(f"\n Skipped Shot Code: {shot_code}, Description: {description}")
+
+    print(f"\n{shot_str.strip()}")  # Print the shot codes as a single string
